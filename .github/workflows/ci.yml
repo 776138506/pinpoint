@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # 门禁：类型检查 + 单元测试（npm test = tsc --noEmit && vitest run）
+      - run: npm test
+      # 双侧产物都构建：dsh 插件（lib/）+ 浏览器扩展（extension/dist/）
+      - run: npm run build

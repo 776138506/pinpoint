@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: npm test
+      - run: npm run build
+
+      # 浏览器扩展：manifest + 页面 + 构建产物，加载已解压扩展即可用
+      - name: 打包浏览器扩展（Chrome/Edge MV3）
+        run: |
+          cd extension
+          zip -r "../pinpoint-extension-${{ github.ref_name }}.zip" . \
+            -x '*.map' -x '__tests__/*'
+
+      # dsh 插件：按 package.json files 字段打包（lib/ + cordis.patch.yml）
+      - name: 打包 dsh 插件
+        run: |
+          pnpm pack
+          mv dsh-point-*.tgz "pinpoint-dsh-plugin-${{ github.ref_name }}.tgz"
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" \
+          --title "Pinpoint ${{ github.ref_name }}" \
+          --generate-notes \
+          "pinpoint-extension-${{ github.ref_name }}.zip" \
+          "pinpoint-dsh-plugin-${{ github.ref_name }}.tgz"
