@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "Pinpoint",
+  "version": "0.1.0",
+  "description": "指哪打哪：在任意网页标记元素并评论，截图+结构化文本直达 dsh 会话",
+  "permissions": [
+    "sidePanel",
+    "tabs",
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://localhost:8897/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "dist/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "dist/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "打开 Pinpoint 侧边栏"
+  },
+  "commands": {
+    "toggle-marking": {
+      "suggested_key": {
+        "default": "Alt+Shift+M",
+        "mac": "Alt+Shift+M"
+      },
+      "description": "开始 / 退出标记模式"
+    }
+  }
+}

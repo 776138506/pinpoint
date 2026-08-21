@@ -1,0 +1,48 @@
+// dsh-point 边界图（阶段一只画"做"的部分；排除项见 DECISIONS D5/D6）
+specification {
+  element actor
+  element system
+  element plugin
+}
+
+model {
+  user = actor '用户'
+
+  dsh = system 'DeepSeek Harness' {
+    webui = container 'dsh Web UI' {
+      description 'preview 面板（srcdoc 同源 iframe + office 主文档渲染）+ 输入框 @ 管道 + 图片附件管道'
+    }
+    host = container 'dsh Host' {
+      description 'system prompt 组装 / 会话事件日志 / AttachmentStore'
+    }
+  }
+
+  point = plugin 'dsh-point 插件（本项目）' {
+    client = container 'client 半段' {
+      description '标记模式（文档级监听+overlay）/ 所指捕获 / 评论窗与待发列表'
+    }
+    hostside = container 'host 半段' {
+      description '仅注册 prompt section：[所指 #n] 格式说明'
+    }
+  }
+
+  ext = plugin 'dsh-point 浏览器扩展（阶段二提前，D16）' {
+    cs = container 'content script' {
+      description '真实网页内标记：悬停高亮/点击捕获/角标/评论窗（复用 engine 捕获与 DOM-clone 截图）'
+    }
+    panel = container 'Side Panel 侧边栏' {
+      description '待发列表/目标会话选择/连接状态（chrome.sidePanel 原生）'
+    }
+    bg = container 'background service worker' {
+      description '中转 fetch 到 localhost:8897（host_permissions 合法跨域），POST /api/session.prompt'
+    }
+  }
+
+  user -> client '标记/评论/发送（dsh 预览面板）'
+  user -> cs '标记/评论（真实网页）'
+  client -> webui 'slot 注入 / 图片附件'
+  hostside -> host 'prompt section'
+  cs -> panel '标记/待发同步（扩展消息）'
+  cs -> bg '发送请求'
+  bg -> host 'POST /api/session.prompt（所指文本+截图）'
+}

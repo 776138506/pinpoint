@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>dsh-point D1 测试页</title>
+  <style>
+    body { font: 16px/1.6 -apple-system, "PingFang SC", sans-serif; padding: 40px; max-width: 800px; margin: 0 auto; }
+    h1 { color: #2563eb; }
+    .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .highlight { background: #f3f4f6; padding: 8px; border-radius: 4px; }
+    button { padding: 8px 16px; border: none; background: #2563eb; color: #fff; border-radius: 6px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>dsh-point 扩展标记测试页</h1>
+  <p class="highlight">这是一个本地静态页，用来验证 content script 的悬停高亮、点击捕获、编号角标和评论窗。</p>
+  <div class="card" data-testid="card-1">
+    <h2>第一张卡片</h2>
+    <p>这是可被标记的文本块。</p>
+    <button>示例按钮</button>
+  </div>
+  <div class="card" data-testid="card-2">
+    <h2>第二张卡片</h2>
+    <p>标记后应出现蓝色编号角标，并弹出评论窗。</p>
+  </div>
+</body>
+</html>

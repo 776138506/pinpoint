@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pinpoint 设置</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: #1f2328;
+      background: #f9fafb;
+    }
+    .container { max-width: 560px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 18px; margin: 0 0 16px; }
+    .section { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+    .section-title { font-weight: 600; margin-bottom: 10px; }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+    .row:last-child { margin-bottom: 0; }
+    label { white-space: nowrap; min-width: 110px; }
+    input {
+      font: inherit; padding: 6px 10px; border-radius: 6px;
+      border: 1px solid #d1d5db; background: #fff; flex: 1; min-width: 0;
+    }
+    button {
+      font: inherit; padding: 6px 14px; border-radius: 6px;
+      border: 1px solid #d1d5db; background: #fff; cursor: pointer; white-space: nowrap;
+    }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    .hint { font-size: 12px; color: #6b7280; margin-top: 6px; }
+    .hint.error { color: #dc2626; }
+    .hint.ok { color: #166534; }
+    details summary { cursor: pointer; color: #6b7280; font-size: 13px; }
+    details .row { margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Pinpoint · 设置</h1>
+
+    <div class="section">
+      <div class="section-title">连接</div>
+      <div class="row">
+        <label for="setting-base-url">实例地址</label>
+        <input id="setting-base-url" placeholder="http://localhost:8897">
+      </div>
+      <div class="hint">dsh（deepseek-harness）实例的 HTTP 地址，保存后即时生效。</div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">标记</div>
+      <div class="row">
+        <label for="shortcut-input">标记快捷键</label>
+        <input id="shortcut-input" readonly placeholder="点击此处，按下组合键" style="cursor: pointer;">
+      </div>
+      <div class="row">
+        <button id="shortcut-reset">恢复默认</button>
+        <button id="shortcut-browser">浏览器级设置</button>
+      </div>
+      <div class="hint">点击输入框后按下要绑定的组合键即完成绑定，需包含 Ctrl / Alt / Shift / ⌘ 至少一个修饰键（防止和正常打字冲突）。自定义组合键在网页内生效；全局生效的浏览器级快捷键在「浏览器级设置」里改。</div>
+      <div id="shortcut-hint" class="hint"></div>
+    </div>
+
+    <div class="section">
+      <details id="advanced-settings">
+        <summary>高级设置（改错可能影响功能，慎改）</summary>
+        <div class="row">
+          <label for="setting-rpc-timeout">RPC 超时(ms)</label>
+          <input id="setting-rpc-timeout" type="number">
+        </div>
+        <div class="row">
+          <label for="setting-send-watchdog">发送看门狗(ms)</label>
+          <input id="setting-send-watchdog" type="number">
+        </div>
+        <div class="row">
+          <label for="setting-screenshot-timeout">截图超时(ms)</label>
+          <input id="setting-screenshot-timeout" type="number">
+        </div>
+        <div class="row">
+          <label for="setting-tab-timeout">页面消息超时(ms)</label>
+          <input id="setting-tab-timeout" type="number">
+        </div>
+        <div class="row">
+          <label for="setting-health-poll">健康轮询(ms)</label>
+          <input id="setting-health-poll" type="number">
+        </div>
+      </details>
+    </div>
+
+    <div class="section">
+      <div class="row">
+        <button id="settings-save" class="primary">保存设置</button>
+        <button id="settings-reset">全部恢复默认</button>
+      </div>
+      <div id="settings-hint" class="hint"></div>
+    </div>
+  </div>
+  <script type="module" src="dist/options.js"></script>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pinpoint 侧边栏</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: #1f2328;
+      background: #f9fafb;
+    }
+    .container { padding: 12px; }
+    h1 { font-size: 15px; margin: 0 0 12px; }
+    .status {
+      padding: 6px 10px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      font-size: 12px;
+    }
+    .status.ok { background: #dcfce7; color: #166534; }
+    .status.error { background: #fee2e2; color: #991b1b; }
+    .status.checking { background: #f3f4f6; color: #4b5563; }
+    .section { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; margin-bottom: 12px; }
+    .section-title { font-weight: 600; margin-bottom: 8px; }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+    .row:last-child { margin-bottom: 0; }
+    select, button, textarea {
+      font: inherit;
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid #d1d5db;
+      background: #fff;
+    }
+    button { cursor: pointer; white-space: nowrap; }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    button.danger { color: #dc2626; border-color: #fca5a5; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    select { flex: 1; min-width: 0; }
+    .outbox-item {
+      border-bottom: 1px solid #f3f4f6;
+      padding: 8px 0;
+    }
+    .outbox-item:last-child { border-bottom: none; padding-bottom: 0; }
+    .outbox-info { font-size: 12px; word-break: break-all; cursor: pointer; }
+    .outbox-info:hover { color: #2563eb; }
+    .outbox-meta { font-size: 11px; color: #6b7280; margin-top: 2px; }
+    .outbox-actions { display: flex; gap: 6px; margin-top: 6px; }
+    .outbox-actions button { font-size: 12px; padding: 4px 8px; }
+    .outbox-editor { margin-top: 6px; }
+    .outbox-editor textarea {
+      width: 100%; min-height: 56px; font-size: 12px; padding: 6px;
+      border: 1px solid #d1d5db; border-radius: 6px; resize: vertical; box-sizing: border-box;
+    }
+    .toolbar { display: flex; gap: 8px; margin-top: 10px; }
+    .toolbar button { flex: 1; }
+    #empty-hint { color: #6b7280; font-size: 12px; text-align: center; padding: 12px 0; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Pinpoint</h1>
+    <div id="status" class="status checking">连接状态：检测中…</div>
+
+    <div class="section">
+      <div class="section-title">目标会话</div>
+      <div class="row">
+        <select id="session-select"></select>
+      </div>
+      <div class="row">
+        <button id="refresh-sessions">刷新列表</button>
+        <button id="create-session">新建测试会话</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">页面标记</div>
+      <div class="row">
+        <button id="toggle-marking" class="primary">开始标记</button>
+      </div>
+      <div id="mark-hint" style="font-size: 11px; color: #6b7280; margin-top: 4px;">
+        开启后悬停高亮，点击元素捕获所指并弹评论窗。快捷键 Alt+Shift+M。
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="row">
+        <button id="open-options" style="flex: 1;">打开设置</button>
+      </div>
+      <div style="font-size: 11px; color: #6b7280;">
+        实例地址、快捷键、超时等参数统一在扩展设置页调整。
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">待发所指</div>
+      <div id="empty-hint">暂无暂存的所指</div>
+      <div id="outbox"></div>
+      <div class="toolbar">
+        <button id="send-all" class="primary" disabled>统一发送</button>
+        <button id="clear-all" disabled>清空</button>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="dist/sidepanel.js"></script>
+</body>
+</html>

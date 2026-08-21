@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dsh-point MEU-0 spike harness</title>
+  <style>
+    :root {
+      --border: #d0d7de;
+      --muted: #57606a;
+      --accent: #ff2d55;
+      --bg: #f6f8fa;
+      --card: #ffffff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      color: #1f2328;
+      background: var(--bg);
+      line-height: 1.5;
+    }
+    header {
+      position: sticky; top: 0; z-index: 50;
+      display: flex; align-items: center; gap: 16px;
+      padding: 12px 20px;
+      background: #ffffff; border-bottom: 1px solid var(--border);
+    }
+    header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+    header .sub { color: var(--muted); font-size: 13px; }
+    .toolbar { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+    .switch { position: relative; display: inline-block; width: 46px; height: 26px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch .slider {
+      position: absolute; cursor: pointer; inset: 0;
+      background: #c9d1d9; border-radius: 999px; transition: background .15s;
+    }
+    .switch .slider::before {
+      content: ""; position: absolute; height: 20px; width: 20px; left: 3px; top: 3px;
+      background: #fff; border-radius: 50%; transition: transform .15s;
+    }
+    .switch input:checked + .slider { background: #2da44e; }
+    .switch input:checked + .slider::before { transform: translateX(20px); }
+    .mode-hint { font-size: 13px; color: var(--muted); }
+    body.mark-mode .mode-hint { color: #cf222e; font-weight: 600; }
+    main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+    section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; margin-bottom: 20px; }
+    section > h2 { margin: 0 0 8px; font-size: 15px; }
+    section > .desc { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+    .frame-wrap { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    #sandbox-frame { width: 100%; height: 420px; border: 0; display: block; background: #fff; }
+    .office-doc {
+      background: #fff; border: 1px solid var(--border); border-radius: 6px;
+      padding: 28px 36px; max-width: 720px;
+      font-family: "Songti SC", "SimSun", serif;
+      color: #111;
+    }
+    .office-doc .doc-title { font-size: 22px; margin: 0 0 14px; }
+    .office-doc .doc-para { margin: 0 0 12px; font-size: 16px; }
+    .office-doc .doc-table { border-collapse: collapse; margin-top: 10px; font-family: -apple-system, sans-serif; font-size: 14px; }
+    .office-doc .doc-table th, .office-doc .doc-table td { border: 1px solid #999; padding: 6px 14px; text-align: left; }
+    .office-doc .doc-table th { background: #eef1f4; }
+    button { cursor: pointer; }
+    .btn {
+      padding: 6px 14px; border: 1px solid var(--border); border-radius: 6px;
+      background: #f6f8fa; font-size: 14px; color: #1f2328;
+    }
+    .btn:hover { background: #eaeef2; }
+    .btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+    .btn.primary:hover { background: #1a5fc7; }
+    #results-list { display: grid; gap: 14px; }
+    .result-card { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; background: #fff; }
+    .result-card h3 { margin: 0 0 8px; font-size: 14px; }
+    .result-card .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 13px; }
+    .result-card .kv dt { color: var(--muted); }
+    .result-card .kv dd { margin: 0; word-break: break-all; }
+    .result-card pre {
+      background: #f6f8fa; border: 1px solid var(--border); border-radius: 6px;
+      padding: 8px; font-size: 11px; overflow: auto; max-height: 120px; white-space: pre-wrap; word-break: break-all;
+    }
+    .result-card img.shot { max-width: 100%; border: 1px solid var(--border); border-radius: 6px; display: block; margin-top: 8px; }
+    .shot-meta { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .fail { color: #cf222e; }
+    .ok { color: #1a7f37; }
+    .empty { color: var(--muted); font-size: 13px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>dsh-point MEU-0 spike harness</h1>
+      <div class="sub">验证：同源沙箱 iframe DOM 可达 · iframe 内区域截图 · office 容器选区捕获</div>
+    </div>
+    <div class="toolbar">
+      <span class="mode-hint" id="mode-hint">标记模式：关</span>
+      <label class="switch">
+        <input type="checkbox" id="mark-mode-toggle" aria-label="标记模式开关">
+        <span class="slider"></span>
+      </label>
+      <button class="btn primary" id="run-all" type="button">一键验证全部</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="sec-iframe">
+      <h2>验证 1 + 2 — 同源沙箱 iframe（srcdoc）DOM 可达 &amp; 区域截图</h2>
+      <p class="desc">iframe 使用 <code>sandbox="allow-same-origin allow-forms allow-popups"</code> + <code>srcdoc</code> 内联 HTML（与 dsh preview 的 srcdoc 渲染形态一致，无 <code>allow-scripts</code>）。标记模式开启后，悬停内部元素红色高亮、点击捕获。</p>
+      <div class="frame-wrap">
+        <iframe id="sandbox-frame" title="agent 生成页面"
+          sandbox="allow-same-origin allow-forms allow-popups"
+          data-testid="web-preview-frame"></iframe>
+      </div>
+    </section>
+
+    <section id="sec-office">
+      <h2>验证 3 — Office 渲染容器（模拟 docx）文本选区捕获 &amp; 区域截图</h2>
+      <p class="desc">普通 div 渲染的类 docx 内容与表格。标记模式开启后，在正文里选择一段文字，然后点「捕获选区」；或直接点击容器内元素做区域截图。</p>
+      <div class="office-doc" id="office-container">
+        <h1 class="doc-title">项目季度报告</h1>
+        <p class="doc-para" id="para-1">本季度我们完成了三项关键交付，整体进度符合预期。团队在性能优化上投入了较多精力，效果显著。</p>
+        <p class="doc-para" id="para-2">下季度计划聚焦稳定性与可观测性，减少线上故障恢复时间，提升整体可用性指标。</p>
+        <table class="doc-table">
+          <thead>
+            <tr><th>指标</th><th>Q2 实际</th><th>Q3 目标</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>可用性</td><td>99.95%</td><td>99.99%</td></tr>
+            <tr><td>P95 延迟</td><td>320ms</td><td>200ms</td></tr>
+            <tr><td>故障恢复</td><td>45min</td><td>15min</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div style="margin-top: 12px; display: flex; gap: 10px;">
+        <button class="btn" id="capture-selection" type="button">捕获选区</button>
+        <button class="btn" id="select-demo" type="button">生成示例选区</button>
+      </div>
+    </section>
+
+    <section id="sec-results">
+      <h2>捕获结果</h2>
+      <div id="results-list"><span class="empty">尚未捕获。开启标记模式后悬停/点击，或点「一键验证全部」。</span></div>
+    </section>
+  </main>
+
+  <!-- Inline HTML for the sandboxed iframe, assigned to srcdoc on load (mirrors dsh's programmatic srcdoc). -->
+  <script type="text/template" id="srcdoc-template">
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 20px; color: #1a1a1a; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  p { margin: 0 0 10px; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 14px; margin-top: 12px; background: #fafafa; }
+  .badge { display: inline-block; padding: 2px 10px; background: #2563eb; color: #fff; border-radius: 999px; font-size: 12px; }
+  ul { margin: 8px 0; padding-left: 22px; }
+  button { padding: 6px 14px; font-size: 14px; }
+  img { max-width: 100%; }
+</style>
+</head>
+<body>
+  <h1 id="page-title">Agent 生成的示例页面</h1>
+  <p class="intro">这是一段由 agent 生成的介绍文字，用于验证 <strong>DOM 可达性</strong>。</p>
+  <div class="card" id="card-1">
+    <span class="badge">卡片</span>
+    <p>卡片内容：这里有几个元素可以悬停/点击。</p>
+    <ul>
+      <li>列表项 A</li>
+      <li>列表项 B</li>
+      <li>列表项 C</li>
+    </ul>
+    <img id="safe-img" alt="内联 SVG 图（data URI，安全）" width="220" height="52"
+      src="data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='52'%3E%3Crect width='220' height='52' fill='%232563eb'/%3E%3Ctext x='110' y='31' font-size='16' fill='white' text-anchor='middle' font-family='sans-serif'%3Edata-uri image%3C/text%3E%3C/svg%3E">
+  </div>
+  <button id="action-btn">点击我</button>
+  <a id="ext-link" href="https://example.com">外部链接</a>
+  <div class="card" id="card-ext-img">
+    <p>外部图片（canvas 污染测试，点击此图触发）：</p>
+    <img id="ext-img" src="https://placehold.co/300x120.png?text=external" width="300" height="120" alt="外部图片">
+  </div>
+</body>
+</html>
+  </script>
+
+  <script src="./node_modules/html2canvas/dist/html2canvas.min.js"></script>
+  <script src="./harness.js"></script>
+</body>
+</html>

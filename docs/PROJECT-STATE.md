@@ -1,0 +1,160 @@
+# 项目状态
+
+## 路线图（长程）
+- 终态（D18 修订）：用户在真浏览器里指着任何网页/文档就能评论发送，所指对象以「截图+结构化文本」直达模型，dsh 会话里渲染为所指卡片
+- 阶段（D18 修订）：**统一架构**——Chrome 插件 = 唯一标记/预览战场；dsh 侧插件 = 所指卡片渲染端；dsh 上游预览层（ui-preview/packages/preview）撤除；阶段三 Office 桌面由扩展文档标记（D2b）取代
+- 当前里程碑：批 D2（plans/010）——D2a 所指 schema+卡片 → D2b 扩展文档标记 → D2c dsh 侧瘦身 → D2d 上游撤除
+
+## 当前状态
+2026-08-20 **批 D2a 已完成**（所指 schema 统一 + dsh 侧所指卡片 + system-prompt section + 单测 + 8899 端到端截图验证）。D18 架构统一终稿已拍板，批 C3 叫停（目标作废，未提交改动留工作区待 D2b 评估复用）。扩展两个实测 bug 已修并构建（会话下拉显名称、删除清高亮），等用户刷新扩展复测。批 D1 联合验收（真浏览器全链）待用户重开侧栏续跑。**批 D2b 待开工**。
+
+## 排队清单
+1. 批 D2a：所指 schema 统一 + dsh 侧所指卡片（plans/010，开工中）
+2. 批 D2b：扩展文档标记（PDF 自渲/Markdown/docx）
+3. 批 D2c：dsh 侧插件瘦身（只留所指卡片）
+4. 批 D2d：上游撤除 ui-preview + packages/preview/*（D2b 落地后）
+5. 用户联合验收：扩展 bug 复测（刷新扩展）+ D1 全链（重开侧栏）+ D2 全链
+6. prompt section 告诉模型所指格式（随 D2a schema 一并考虑）
+7. 标记持久化（切会话/刷新后保留，扩展侧）
+8. 扩展：dsh → 扩展反向通道（backlog）；扩展商店上架/Firefox/鉴权（backlog）
+
+## 待用户输入
+- （无）
+
+## 变更日志（纯增量，唯一的历史通道）
+### 2026-08-21 ｜ 测试加固 + ocr 审查修复（schema/mark-utils/shortcut/扩展三文件）
+- 变更：
+  - 扩展 schema 边界测试：`src/schema/mark-format.spec.ts` 从 13 例增至 27 例，覆盖非法 JSON、缺必填字段、未知字段透传/拒绝行为、version 不匹配、`parseMarkText` 空串/畸形 fence/JSON 数组与原始值/嵌套 fence、`extractReferents` 重复 payload/空锚点/与畸形块共存。
+  - 新增 `src/client/mark-utils.spec.ts`（25 例），使用 jsdom 覆盖 `cssPath`、`visibleText`、`snippet`、`detectExternalImages`、`cloneForScreenshot`、`documentRectOf`、`xpathFor`、`textFragmentFor`、`codeLocationFor` 的构造/序列化/边界；DOM 依赖部分全部在 jsdom 环境运行。
+  - 新增 `extension/src/shortcut.spec.ts`（6 例），覆盖 `comboFromEvent` 修饰键组合、单键拒绝、大小写统一、非字符键（F5/方向键/Escape/Enter）。
+  - 安装 `jsdom` + `@types/jsdom` 到项目内 `devDependencies`；通过 `// @vitest-environment jsdom` 指令为 DOM 测试指定环境，未改动默认 node 环境。
+  - ocr scan 审查 `extension/src/content.ts`、`background.ts`、`sidepanel.ts`（25 条评论），修复 P0/P1：
+    - `background.ts`：`fetch` 增加 15s `AbortController` 超时；`port.onMessage` 加顶层 try/catch；`checkConnection`/降级分支去除死三元；`chrome.commands.onCommand` 加 try/catch；`STAGE_MARK` 入队前校验 `mark.index`；`session.list`/`session.create`/`SEND_MARK` 增加运行时形状校验。
+    - `sidepanel.ts`：增加 `safePost` 与 `port.onDisconnect` 处理；`getElementById` 改为 `reqEl` 显式空值检查；`STAGE_MARK` 改为合并已有记录而非丢弃更新；`sendToActiveTab` 增加 1.5s 超时；健康轮询使用具名常量并随断开清理。
+    - `content.ts`：删除未使用的 `disposed` 标志；`renderBadges` 保存元素原始 outline/outlineOffset；`releaseElement` 恢复原始 outlineOffset；评论窗发送增加 10s 超时看门狗；暂存按钮改用 Promise 并处理失败；点击捕获增加 `captureInFlight` 互斥防止并发。
+- 旧值：schema 测试仅 13 例；mark-utils/shortcut 无测试；扩展三文件存在多处无超时外部调用、裸 catch、XSS/选择器误伤隐患、端口断连未处理、弹窗死锁、并发捕获等隐患。
+- 原因：用户要求按序加固测试并在 ocr 审查后修复 P0/P1；测试优先锁定现有行为，实现改动仅针对已确认缺陷。
+- 验证：`npm test` 58/58 passed（3 files）；`npm run build` 绿；`pnpm add -D jsdom @types/jsdom` 仅改项目内依赖。
+- 未验证项：未在真实浏览器/扩展环境中运行（只跑纯单元测试，未起 dsh 服务/未装扩展）；ocr 提出的部分 P2（如自定义快捷键 TOCTOU、`renderSessions` 在渲染中改状态、`BASE` URL 硬编码）本次未修复，已记录待后续评估。
+
+### 2026-08-20 ｜ 批 D2a 完成：所指 schema 统一 + dsh 侧所指卡片
+- 变更：新增 `src/schema/` 作为所指消息单一事实源；`extension/src/background.ts` 与 `src/client/util.ts` 统一调用 schema 生成；dsh 侧新增 `src/client/referent-card.ts` 通过 DOM MutationObserver 将含 schema 的用户消息渲染为所指卡片；node 半段注册 `dsh-point:referent-format` system-prompt section；新增 vitest 单测并跑绿；8899 端到端 ego-browser 截图验证卡片（截图缩略 + 来源/选择器/摘录/评论）。
+- 旧值：schema 由 `src/client/util.ts` 的 `formatMarkText` 单独维护，扩展与 dsh 侧格式可能分叉；dsh 侧无结构化卡片，所指消息以纯文本气泡显示；无 system-prompt 说明；无单测框架。
+- 原因：D18 架构统一要求 schema 单一事实源、dsh 侧唯一职责为卡片渲染；批 D2a 按计划落地。
+- 证据：`spike/evidence/batch-d2a/02-card-selected.png`。
+- 已知上限：消息正文无正式 slot，卡片增强依赖 DOM 结构；多条合并发送未在端到端中实测。
+
+### 2026-08-20 ｜ 批 D2a 代码审查收尾（ocr review）
+- 变更：`src/schema/mark-format.ts` 完成三轮 `ocr scan` 发现并修复：消除 `parseMarkText`/`parseBlock` 重复、移除嵌套三元表达式、`extractReferents` 改用 `matchAll` 避免 `lastIndex` 泄漏、摘要对人类可读部分做 HTML 转义并折叠空白、JSON 序列化前将反引号编码为 `\u0060` 防止用户内容破坏 Markdown fence、`parseBlock` 异常时只记录错误消息避免泄露用户内容、版本号 JSDoc 明确为 exact match、单测新增对应覆盖（10 个用例全绿）。
+- 旧值：schema 层存在代码重复、嵌套三元、静默吞异常、未对用户内容做 HTML 转义、反引号可破坏 fence。
+- 原因：项目验证体系要求交付前完成 `ocr review` 并处理发现；安全与健壮性问题需在 D2a 闭合。
+- 验证：`pnpm run build` 绿，`pnpm run test` 10 passed，`src/schema/mark-format.ts` diagnostics 无错误。
+
+### 2026-08-18 ｜ L2 反馈：交互流修订（D11）
+- 变更：SCOPE 场景 1 增删功能行（+页面角标反馈/+评论窗/+待发列表，@引用芯片标 ✂）；排队清单重排为 MEU-1 标记+反馈 → MEU-2 评论窗+待发列表 → MEU-3 发送管道；新增 plans/002
+- 旧值：排队清单原为「MEU-1 标记+捕获 / MEU-2 @芯片+序列化 / MEU-3 prompt section」；SCOPE 有「@ 引用芯片进输入框草稿」⬜ 行
+- 原因：用户验收反馈——标记后要页面原位反馈、标记现场弹评论窗、支持逐条即发与统一发；映射 SCOPE 场景 1，属③增强，当场过堂确认
+### 2026-08-18 ｜ MEU-0 spike 通过
+- 变更：当前状态从「建档」推进到「spike 完成，可开工 MEU-1」；排队清单移除 MEU-0；plans/001 回填实际范围（预估 2 项 = 实际 2 项，零偏差）；DECISIONS 追加 D10（D9 闭环）
+- 旧值：当前状态原为「项目建档，MEU-0 开工」；排队清单首位原为 MEU-0
+- 原因：harness 三验证全过 + 第三方 client 插件端到端跑通，设计假设全部成立
+### 2026-08-18 ｜ 项目建档
+- 变更：创建三件套 + SCOPE + plans/001 + architecture.c4
+- 原因：需求讨论（宿主/形态/交互流三问）与设计确认完成，进入 L1
+
+### 2026-08-18 ｜ MEU-1 完成
+- 变更：标记模式 + 捕获 + 页面原位反馈（编号角标 + 保持高亮）实现并验证；D12 落地，主文档监听收窄到 `div[data-office]`，iframe 只挂 `iframe[data-testid="web-preview-frame"]`；宿主 UI 点击提示「只能标记预览面板里的内容」；`spike/REPORT-meu1.md` 与 ego-browser 证据截图生成；plans/002 回填实际范围；SCOPE 对应行状态更新。
+- 旧值：当前状态为「MEU-0 spike 通过，MEU-1 未开工」；SCOPE 中「页面原位反馈」为 ⬜。
+- 原因：完成 MEU-1 全部验收项，进入 MEU-2 前置状态。
+
+### 2026-08-19 ｜ L2 验收反馈过堂：上游化路线（D13）
+- 变更：DECISIONS 追加 D13（修订 D5/D12：preview 扩展点上游化、笔刷搬进 preview.toolbar）；SCOPE +2 行（落地页、工具栏子槽）、发送管道行改写两路；排队清单重排为 批 A（plans/003）→ 批 B（plans/004）→ 笔刷搬家+联合验收
+- 旧值：排队清单原为「MEU-1 → MEU-2 评论窗+待发列表 → MEU-3 发送管道」；D5 原为「不改 dsh 本体」；笔刷入口原为会话头部
+- 原因：用户验收反馈三条——笔刷应在预览页、评论入口缺失（=MEU-2 优先级确认）、预览默认要 Codex 式落地页；ui-preview 无子槽，纯插件路线等于重写预览面板，上游化最快最干净
+
+### 2026-08-19 ｜ 批 A + 批 B + 笔刷搬家完成，进入联合验收
+- 变更：SCOPE 场景 1 五行（评论窗/待发列表/发送管道/落地页/toolbar 子槽+笔刷搬家）⬜→✅；plans/003、004 回填实际范围；当前状态推进到「等用户联合验收」；排队清单重排为 验收 → prompt section → 标记持久化 → /preview-file → preview_asset 暴露
+- 旧值：当前状态原为「批 A/批 B 并行开工」；排队清单原为「批 A → 批 B → 笔刷搬家+联合验收」
+- 原因：批 A（test:gui 3779 绿 + 快照 replay 绿 + 落地页截图）与批 B（评论/暂存/统一发/已发送态截图 + Kimi K3 真实收到图片回复）经主 agent 对抗复核通过；笔刷槽位从 `conversation.session.header.actions` 改为 `preview.toolbar` 并在 8897 实例截图验证（joint-03）
+- 附带记录：批 B 修了两个实现 bug（dataUrlToFile 硬校验 PNG；iframe 内元素截图空 data URL → cloneForScreenshot）；发图只有 Kimi K3 过得了 harness 附件校验
+
+### 2026-08-19 ｜ L2 二轮验收反馈过堂：右侧栏 + 网页代理（D14）
+- 变更：DECISIONS 追加 D14；新增 plans/005（批 C1 待发列表搬 preview.footer + 入口常驻）、plans/006（批 C2 网页代理浏览器化，拆 C2a/C2b）；当前状态推进到 C1+C2a 并行开工；排队清单重排为 C1 → C2a → C2b → C3 → prompt section → 标记持久化
+- 旧值：当前状态原为「等用户联合验收」；排队清单首位原为「用户联合验收（8897）」
+- 原因：用户验收反馈三条——①待发列表搬右侧栏（原 composer.dock 在对话框下方）；②打开网页要类浏览器访问真实网站（侦察：百度 CSP frame-ancestors、必应 XFO SAMEORIGIN 封锁直连 iframe，只能走 host 代理）；③打开文档扩展 PDF/Markdown
+
+### 2026-08-19 ｜ 批 C1 完成（preview.footer + 待发列表搬家 + 打开入口常驻 + engine observer 修复）
+- 变更：ui-preview 上游加 `preview.footer` 子槽（list/session，PreviewPanel 底部 renderSlot）；dsh-point PointDock 从 `conversation.composer.dock` 迁到 `preview.footer`，可折叠「待发所指 (n)」默认展开、空列表不渲染；「打开网页」「打开 Office 文档」入口常驻 `preview.toolbar`（viewing 态也在）；附带修复 `engine.ts` 的 MutationObserver 在 `dispose()` 未断开导致切会话后旧 controller 抢占新 iframe 的标记捕获失效；plans/005 回填实际范围
+- 旧值：待发列表原挂 `conversation.composer.dock`（对话框下方）；打开入口只在落地页；engine observer 未断开
+- 原因：D14 落地 + 端到端验证时发现 engine observer 泄漏（批 A/B 遗留，非 C1 引入）阻断标记，最小修复以闭合 C1 验收
+
+### 2026-08-19 ｜ 批 C2d 完成（代理质量收尾：loopback 白名单 + 错误页中文化 + JS 资源拦截 + 缩放适配 + 历史栈去重定向跳）
+- 变更：dsh 上游 `packages/host/webserver/src/preview-proxy.ts` 收窄 SSRF 白名单（放行 loopback，其余私网段维持拦截）、`renderErrorPage()` 中文 HTML 错误页、注入脚本拦截 fetch/XHR/Image.src 并回传 `dsh-preview-loaded`；`packages/client/ui-preview` 加「缩放适配/实际宽度」切换（1280px 桌面视口 + transform scale）与历史栈去重定向跳；dsh-point `engine.ts` 角标坐标适配缩放。SCOPE 场景 1「外部 URL 预览元素级标记」✂→✅（代理使其同源可标）。plans/008 回填实际范围；DECISIONS 追加 D15
+- 旧值：外部 URL 跨源不可标（D6）；代理错误页为裸 JSON；loopback 被 SSRF 拦截；JS 动态资源（必应壁纸）404；桌面站窄面板显示不全；历史栈记录 302 中间跳
+- 原因：用户验收反馈四条 + 主 agent 复验发现后退卡 302 中间跳；loopback 放行已由用户拍板（本地开发页可预览）
+- 已知上限（JS 资源拦截兜不住）：JS 字符串拼接 URL、WebSocket、CSSOM 内联样式动态改背景、`<link>/<script>` 动态注入，写入 DECISIONS D15 与最终交付说明
+
+### 2026-08-19 ｜ 批 C2b 完成（补录：预览面板浏览器化 chrome）
+- 变更：预览面板 web 模式加地址栏（显示真实 URL、可编辑回车跳转）+ 后退/前进/刷新；代理页内导航 postMessage → 宿主历史栈（百度 GET 搜索表单序列化生效）；SandboxedFrame 对代理页放开 allow-scripts；plans/006 回填实际范围。主 agent 在 8897 亲验：百度渲染/搜索/链接跳转/前进后退 ✅
+- 旧值：预览面板打开网页仅落地页输入 URL 直渲，无浏览器 chrome
+- 原因：D14 第 3 条落地的后半批；已知打磨项——历史栈当时记录 302 中间跳（后退会落在跳转中间页），已在批 C2d 修复
+- 补录说明：本条目因批 C2d 收尾时一并回填 plans/006 而迟录，证据见 spike/evidence/c2-verify/
+
+### 2026-08-20 ｜ 批 D1 完成（浏览器扩展 MVP）
+- 变更：`dsh-point/extension/` MV3 扩展交付；content script 移植标记引擎、Side Panel 承载待发列表/会话选择/连接状态、background service worker 中转 `localhost:8897/api/session.prompt`；`src/client/mark-utils.ts` 抽取纯函数与 `engine.ts` 共享；`package.json` build 脚本同步构建扩展；plans/009 回填实际范围；SCOPE 场景 2 行状态更新
+- 旧值：浏览器扩展仅立项，无代码；场景 2 content script 圈选为 ⬜
+- 原因：协议实测通过（文本+图片均达 8897 测试会话），按 D16 边界完成最小可用扩展闭环
+- 证据：`spike/evidence/batch-d1/ego-mark-captured.png`；协议测试会话 `session-a0e6a86c-5a02-4875-954a-9c8f923ab609`
+- 已知上限：扩展商店/Firefox/鉴权/PDF 内标记/captureVisibleTab 未做；端到端装扩展真浏览器运行属联合验收项
+
+### 2026-08-20 ｜ 批 D1 立项（浏览器扩展提前，D16）
+- 变更：DECISIONS 追加 D16（MV3 + Side Panel + background 中转通道 + DOM-clone 截图 + 引擎复用策略）；新增 plans/009；architecture.c4 加扩展插件边界（content script / Side Panel / background 三容器）；排队清单重排为 D1 → C3 → 联合验收
+- 旧值：浏览器扩展原排在阶段二（路线图中远期）；C3 原排首位
+- 原因：用户验收代理方案后确认其硬缺陷（登录态/SPA/视频/反爬）需治本，拍板扩展提前并要求保持侧边栏模式；C3 用户明示排在 D1 之后
+
+### 2026-08-20 ｜ 批 D1 代码完成 + 信任栅栏修复（D17）
+- 变更：扩展 MVP 落地（`dsh-point/extension/`：MV3 + Side Panel + content script 标记 + background 中转）；`src/client/mark-utils.ts` 抽取共享纯函数（engine.ts 与扩展共用）；dsh 上游 `packages/client/connection/src/api-request-trust.ts` 放行扩展 Origin（D17）；plans/009 回填实际范围；SCOPE 场景 2 行状态更新
+- 旧值：浏览器扩展为空白；dsh /api 对扩展 Origin 一律 403
+- 原因：批 D1 实施 + 联合验收发现 403 阻断（node 直测无 Origin 头掩盖）；已 curl 验证放行精确（扩展通/恶意网站仍拦）
+- 待办：真浏览器端到端联合验收（装扩展→标记→发送→8897 查收）进行中
+
+### 2026-08-20 ｜ D18 架构统一终稿 + 扩展 bug 修复 + C3 叫停
+- 变更：DECISIONS 追加 D18（预览层撤到 Chrome 插件、dsh 侧插件变薄为所指卡片端、上游 ui-preview 待 D2b 后撤除、所指 schema 统一）；新增 plans/010（批 D2 四子批）；路线图/当前状态/排队清单整体改写；批 C3 叫停（agent-17 killed，未提交改动留 deepseek-harness 工作区待 D2b 评估复用）
+- 旧值：路线图为「阶段一 dsh Web UI 内闭环 → 阶段二 浏览器扩展 → 阶段三 Office 桌面」；D13 上游化路线有效；排队首位为批 D1/C3
+- 原因：用户三轮架构校准后拍板——真浏览器即预览器，代理路线硬缺陷（登录态/SPA/视频/反爬）在真浏览器天然不存在；dsh 侧插件只保留所指卡片渲染（用户确认）；上游撤除时机 = 扩展文档标记落地后（用户确认）
+- 同批修复（扩展实测 bug）：会话下拉显示 `projections.values.title`（background.ts LIST_SESSIONS 映射 + sidepanel.ts 渲染）；删除/清空标记释放元素 KEPT_OUTLINE 高亮（content.ts 新增 releaseElement）；`pnpm run build` 绿，待用户 chrome://extensions 刷新复测
+
+### 2026-08-20 ｜ 所指精准锚点（用户验收反馈）
+- 变更：所指消息新增 `anchor` 通道（schema ReferentAnchor，可选）——文档坐标 rect / XPath / Text Fragments 文本锚（可拼 URL 直接滚动高亮）/ 代码位置（GitHub/GitLab 风格页面尽力识别文件+行号）；捕获助手进 `src/client/mark-utils.ts` 共享，扩展 content.ts 捕获时填充；人读摘要新增「代码位置 / 定位 / 坐标」行；schema 版本保持 `dsh-point/referent@1`（可选字段，向后兼容）；13/13 测试绿
+- 原因：用户要求所指像坐标一样精准锁定，避免接收方反复查找沟通
+
+### 2026-08-21 ｜ 标记全灭事故修复（OWN_UI_SELECTOR 子串误伤）
+- 变更：content.ts 自有 UI 排除选择器从 `[class*="dsh-point-ext"]` 子串匹配改为精确类名枚举（overlay/badge/popup-layer/popup/toast）
+- 旧值：子串选择器命中 body 上的标记态类名 `dsh-point-ext-marking`，标记模式下每个元素都被排除 → 全页面无法标记
+- 原因：08-20 修「评论窗被高亮」时引入；经 ego 实机复现（标记态开但悬停/点击无响应）+ 控制变量探针定位；修复后实机 E2E 全链验证通过（标记/高亮/捕获/评论窗/截图）
+- 教训：自有 UI 排除禁用属性子串通配，必须枚举精确类名；扩展改动后核心链路要实机复测
+
+### 2026-08-21 ｜ 草稿标记生命周期修复（孤儿高亮 + 重复捕获）
+- 变更：content.ts 评论窗「×」关闭草稿态标记 = 撤销（清高亮+角标）；onClick 命中已标记元素（含子元素）时重开评论窗而非重复捕获
+- 旧值：捕获即挂高亮+角标，关闭评论窗不清理 → 页面留高亮但暂存区无记录；再点同元素重复捕获
+- 原因：用户验收反馈；ego 实机 E2E 验证（关闭即全清 / 暂存后重开不重复）
+
+### 2026-08-21 ｜ 暂存列表跳转定位 + 评论二次编辑（用户验收反馈）
+- 变更：暂存项点击跳转——STAGE_MARK 链路携带 tabId（background 从 sender.tab 提取，缓冲/冲刷同带）；侧栏点击暂存项 info → FOCUS_MARK（background 激活标签页+聚焦窗口，content 滚动居中+box-shadow 脉冲闪烁 1.8s，selector 失效回退 anchor.xpath）；暂存项新增「编辑」按钮行内二次编辑评论，保存同步 UPDATE_MARK 到来源页；删除/清空/发送状态同步从「活动页」改为「标记来源页」（修跨 tab 残留高亮隐患）；测试 58/58 绿 + build 绿；ego 实机验证（闪烁类出现/消失、标签页激活、编辑同步到页面评论窗）
+- 原因：用户要求暂存列表可直达标记位置（闪烁提醒）并支持评论二次编辑
+- 已知上限：updateUi 全量重渲染会丢弃未保存的行内编辑内容（ponytail：不加草稿保护）
+
+### 2026-08-21 ｜ 不变量归并审计补漏（Esc 退出草稿 + 重载残留 DOM）
+- 变更：按 状态×事件 矩阵审计「页面高亮 ⇔ 暂存区有记录」全路径，补两个空格——①退出标记态（Esc/快捷键/侧栏）时 settleDraft 了结草稿（有评论自动暂存、无评论撤销）；②mount 时清理扩展重载后旧实例残留的 overlay/popup/toast DOM（防双 overlay/僵尸角标；旧内联 outline 无法枚举，随页面刷新消失，ponytail 上限已注）
+- 原因：用户纠正"点修未归并根因"后按新机制（~/.agents/docs/llm-deficiency-compensation.md 第 1/10 行）回扫同族路径
+- 验证：58/58 测试绿 + build 绿；ego 实机——Esc 无评论=全清、Esc 有评论=自动暂存并冲刷到侧栏
+
+### 2026-08-21 ｜ 五问审视整改：3 个 P1 + 参数分级可调（不器）
+- 变更（五问审视后整改）：
+  - 枚举 P1：mark.index 原为 tab 内编号却在暂存区当全局键——跨 tab 同号互覆；暂存区改 (tabId,index) 复合键，SEND_MARK/SEND_RESULT 透传 tabId
+  - 容错 P1：html2canvas 加超时（挂起曾致标记功能静默锁死）
+  - 复归 P1：stagedQueue 持久化 chrome.storage.session（MV3 SW 死亡不再丢缓冲；超限降级纯内存，ponytail 已注）
+  - 不器整改（用户拍板）：参数三级分级——L1 实例地址（侧栏设置区）、L2 高级五项超时/轮询（折叠区+慎改提示）、L3 系统常量不开放；每字段带合法域校验（端口范围/超时上下限），非法拒收；三容器（background/content/sidepanel）经 chrome.storage 缓存+热更新；状态栏显示配置地址；设置变更立即重检连接；RPC 错误体截断 120 字符防 HTML 撑爆状态栏
+- 新增：extension/src/settings.ts + settings.spec.ts（8 例）；测试 66/66 绿
+- 验证：ego 实机——跨 tab（example.com+org）双 #1 不合并；改地址 9999 立即如实显示未连接；非法输入被拒；恢复默认回 8897
+- 注意：localhost:9999 实为 Hindsight Control Plane（Docker），非 dsh

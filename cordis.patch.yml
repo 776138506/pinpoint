@@ -1,0 +1,7 @@
+# dsh-point bundle patch: mounts the plugin's node half as a Loader entry so the
+# dsh-client-modules node half can scan its package.json `dsh.client` declaration
+# and serve the browser bundle at /plugins/dsh-point/client.js. The node-half
+# apply is empty; the real contribution is the client bundle's slot injection.
+- insert:
+    - id: point
+      name: dsh-point
