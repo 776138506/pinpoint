@@ -184,3 +184,14 @@
 ### 2026-08-24 ｜ 侧栏去重：移除面板内 h1
 - 变更：extension/sidepanel.html 删除 `<h1>Pinpoint</h1>` 及其 CSS——顶栏（manifest name 渲染）与面板标题重复
 - 验证：66/66 测试绿 + build 绿；ego 重载后 DOM 断言 h1=null、首元素为状态条，截图确认视觉
+
+### 2026-08-24 ｜ 标记态「复归」修复：不支持页无法退出标记 + port 断线自愈
+- 变更：
+  - background 新增 markingTabs 按 tab 跟踪标记态；整页导航（status:loading）/关 tab 自动出清并同步侧栏按钮；切 tab 时按钮反映新活动 tab 标记态
+  - 活动页不支持标记但仍有 tab 在标记时，toggle（侧栏按钮与 Alt+Shift+M 同语义）视为「退出全部标记」——强制 SET_MARKING false + 复位侧栏，不再卡死报错
+  - sidepanel port 断线自动重连（1s 重试 + 重连后补 HEALTH_CHECK/LIST_SESSIONS）；断线不再停健康轮询——轮询报文兼作 SW 唤醒器
+  - 新增 extension/src/background.spec.ts（4 条回归：强制退出/导航出清/SPA 不误清/正常 toggle 跟踪），chrome API 全 stub 动态 import
+- 旧值：标记态为全局单值且无按 tab 跟踪；活动页不支持标记时 toggle 只报错；port 断开即死（面板后台节流时点击静默无反应）
+- 原因：用户验收发现「支持页进入标记 → 进入不支持页无法退出」（留白缺口：不支持页无状态落点）
+- 验证：红灯复现 3/4 → 修复后 70/70 绿（含 tsc）+ build 绿。ego 端到端部分验证——content 标记/退出机制、面板↔background 消息链路实测通；但 ego 任务空间窗口拿不到 OS 焦点，chrome.tabs.query currentWindow 恒为用户窗口，面板点击→活动 tab 的完整回路无法决定性复现（依赖单元测试兜底）；调试期间曾误触用户窗口标记态，已全量广播 SET_MARKING false 清理
+- 教训：MV3 SW 空闲即死、长连 port 随之断——面板类 UI 必须有断线重连；ego 任务空间验证涉及「当前焦点窗口」语义的扩展 API 时有方法论盲区

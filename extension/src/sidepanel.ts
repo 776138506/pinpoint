@@ -41,17 +41,44 @@ function itemKey(i: { tabId?: number; index: number }): string {
   return `${i.tabId ?? 'legacy'}:${i.index}`
 }
 
-const port = chrome.runtime.connect({ name: 'dsh-point-panel' })
+// 2026-08-24: port 断线自动重连（复归整改）。MV3 SW 空闲即死、port 随之断开；
+// 面板作后台 tab 时健康轮询被 Chrome 节流，撞死 port 后点击按钮静默无反应。
+let port: chrome.runtime.Port | null = null
 
-function safePost(message: unknown): void {
-  try { port.postMessage(message) } catch (e) { console.warn('[dsh-point-ext] post to background failed:', e) }
+function connectPort(): void {
+  let p: chrome.runtime.Port
+  try {
+    p = chrome.runtime.connect({ name: 'dsh-point-panel' })
+  } catch (e) {
+    // 扩展重载/更新后旧页面上下文失效，connect 会抛——过 1s 再试
+    console.warn('[dsh-point-ext] connect failed, retry in 1s:', e)
+    setTimeout(connectAndResync, 1000)
+    return
+  }
+  p.onMessage.addListener(onPortMessage)
+  p.onDisconnect.addListener(() => {
+    if (port !== p) return
+    port = null
+    state.connected = false
+    state.statusError = '与后台连接已断开，重连中…'
+    updateUi()
+    setTimeout(connectAndResync, 1000)
+  })
+  port = p
 }
 
-port.onDisconnect.addListener(() => {
-  state.connected = false
-  state.statusError = '与后台连接已断开'
-  updateUi()
-})
+function connectAndResync(): void {
+  connectPort()
+  // 重连后补齐状态（标记按钮态由后续 toggle/切 tab 事件刷新）
+  safePost({ type: 'HEALTH_CHECK' })
+  safePost({ type: 'LIST_SESSIONS' })
+}
+
+function safePost(message: unknown): void {
+  try { port?.postMessage(message) } catch (e) { console.warn('[dsh-point-ext] post to background failed:', e) }
+}
+
+connectPort()
 
 function reqEl<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id)
@@ -324,7 +351,9 @@ clearAllBtn.addEventListener('click', async () => {
 
 /* ---------- background port messages ---------- */
 
-port.onMessage.addListener((message) => {
+// port 消息为动态载荷（与 background 的约定见 protocol 注释），沿用 any 不做运行时收窄
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function onPortMessage(message: any): void {
   if (!message || typeof message !== 'object') return
   switch (message.type) {
     case 'STATUS':
@@ -412,10 +441,11 @@ port.onMessage.addListener((message) => {
     default:
       break
   }
-})
+}
 
 // Polling health so the panel reflects when the dsh instance comes/goes.
 // 2026-08-21: 轮询间隔可调，设置变更时重启定时器
+// 2026-08-24: port 断线不再停轮询——轮询报文既是健康检查也是重连后的 SW 唤醒器
 let healthPollTimer: ReturnType<typeof setInterval> | null = null
 function restartHealthPoll(): void {
   if (healthPollTimer !== null) clearInterval(healthPollTimer)
@@ -423,7 +453,6 @@ function restartHealthPoll(): void {
     safePost({ type: 'HEALTH_CHECK' })
   }, extSettings.healthPollMs)
 }
-port.onDisconnect.addListener(() => { if (healthPollTimer !== null) clearInterval(healthPollTimer) })
 
 // 2026-08-21: 设置已统一迁入扩展选项页（options.html），此处仅消费 settings 变更
 // Initial load.

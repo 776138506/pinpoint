@@ -103,6 +103,47 @@ async function toggleMarkingOnTab(tabId: number): Promise<{ marking?: boolean; e
   }
 }
 
+/**
+ * 2026-08-24: 标记态按 tab 跟踪（复归整改）。
+ * 用户痛点：在支持页开启标记后切到/导航到不支持页（chrome://、应用店、PDF），
+ * 退出无路——toggle 以活动 tab 为目标，注入失败即报错，侧栏按钮卡在「退出标记」。
+ * 修复三件套：①map 跟踪哪些 tab 在标记 ②整页导航/关 tab 自动出清并同步侧栏
+ * ③活动页不支持标记但仍有 tab 在标记时，toggle 视为「退出全部标记」而非报错。
+ * ponytail: 纯内存，SW 死亡会丢跟踪——代价是退回旧行为（报错提示），可接受。
+ */
+const markingTabs = new Set<number>()
+
+function setTabMarking(tabId: number | undefined, marking: boolean | undefined): void {
+  if (tabId === undefined || typeof marking !== 'boolean') return
+  if (marking) markingTabs.add(tabId); else markingTabs.delete(tabId)
+}
+
+/** 强制退出所有仍在标记的 tab（best-effort：页面已导航的由 onUpdated 兜底出清） */
+async function forceExitMarking(): Promise<void> {
+  const tabs = [...markingTabs]
+  markingTabs.clear()
+  for (const id of tabs) {
+    try {
+      await chrome.tabs.sendMessage(id, { type: 'SET_MARKING', marking: false })
+    } catch (e) {
+      console.debug('[dsh-point-ext] force exit: tab unreachable (navigated?), cleared locally:', e)
+    }
+  }
+}
+
+// 整页加载后 content script 重建、标记态必为 false——出清并同步侧栏按钮。
+// 只认 status:'loading'：SPA 的 pushState 只带 url 不带 loading，误清会丢真标记态
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'loading' && markingTabs.delete(tabId)) {
+    postToPanel({ type: 'MARKING_STATE', marking: false })
+  }
+})
+chrome.tabs.onRemoved.addListener((tabId) => { markingTabs.delete(tabId) })
+// 切 tab 后侧栏按钮反映新活动 tab 的标记态（未知即未标记）
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  postToPanel({ type: 'MARKING_STATE', marking: markingTabs.has(tabId) })
+})
+
 function extractBase64(dataUrl: string): string | null {
   const m = /^data:image\/[a-zA-Z0-9.+]+;base64,(.+)$/s.exec(dataUrl)
   return m ? m[1] : null
@@ -268,8 +309,15 @@ chrome.runtime.onConnect.addListener((port) => {
           }
           const outcome = await toggleMarkingOnTab(tab.id)
           if (outcome.error) {
-            postToPanel({ type: 'MARKING_ERROR', error: outcome.error })
+            // 2026-08-24: 活动页不支持标记但仍有 tab 在标记——用户意图是退出，强制出清
+            if (markingTabs.size > 0) {
+              await forceExitMarking()
+              postToPanel({ type: 'MARKING_STATE', marking: false })
+            } else {
+              postToPanel({ type: 'MARKING_ERROR', error: outcome.error })
+            }
           } else {
+            setTabMarking(tab.id, outcome.marking)
             postToPanel({ type: 'MARKING_STATE', marking: outcome.marking })
           }
           break
@@ -338,6 +386,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === 'MARKING_STATE_SYNC') {
     // content script 内自定义快捷键切换后同步侧栏按钮状态
+    // 2026-08-24: 同步进按 tab 跟踪（切 tab/导航出清的前提）
+    setTabMarking(sender.tab?.id, message.marking)
     postToPanel({ type: 'MARKING_STATE', marking: message.marking })
     sendResponse({ ok: true })
     return false
@@ -354,10 +404,17 @@ chrome.commands.onCommand.addListener(async (command) => {
     if (!tab?.id) return
     const outcome = await toggleMarkingOnTab(tab.id)
     if (outcome.error) {
-      await chrome.action.setBadgeText({ text: '!' })
-      await chrome.action.setBadgeBackgroundColor({ color: '#dc2626' })
-      setTimeout(() => void chrome.action.setBadgeText({ text: '' }), 3000)
+      // 2026-08-24: 与侧栏路径同一语义——仍有 tab 在标记时视为退出全部
+      if (markingTabs.size > 0) {
+        await forceExitMarking()
+        postToPanel({ type: 'MARKING_STATE', marking: false })
+      } else {
+        await chrome.action.setBadgeText({ text: '!' })
+        await chrome.action.setBadgeBackgroundColor({ color: '#dc2626' })
+        setTimeout(() => void chrome.action.setBadgeText({ text: '' }), 3000)
+      }
     } else {
+      setTabMarking(tab.id, outcome.marking)
       postToPanel({ type: 'MARKING_STATE', marking: outcome.marking })
     }
   } catch (e) {
