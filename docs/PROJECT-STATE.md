@@ -158,3 +158,19 @@
 - 新增：extension/src/settings.ts + settings.spec.ts（8 例）；测试 66/66 绿
 - 验证：ego 实机——跨 tab（example.com+org）双 #1 不合并；改地址 9999 立即如实显示未连接；非法输入被拒；恢复默认回 8897
 - 注意：localhost:9999 实为 Hindsight Control Plane（Docker），非 dsh
+
+### 2026-08-24 ｜ 设置迁入选项页 + itemKey 复合键修复 + Pinpoint 更名发布 GitHub
+- 变更：
+  - 设置统一迁入扩展选项页（options.html + src/options.ts），侧栏只留「打开设置」入口（chrome.runtime.openOptionsPage）；侧栏内旧设置表单/快捷键录入代码清除
+  - 快捷键改「按键即绑定」：聚焦输入框按下组合键立即保存；无效按键给原因反馈（单字母拒收/只按修饰键提示补主键/Esc 取消/Tab 留给焦点导航）；选项页移除 L1/L2 分级 jargon（用户：分级字样不应出现在前端）
+  - 修 itemKey 复合键失配 P0：OutboxItem 无顶层 index（在 mark.index），三处 find 全部失配——sendNow 自动发送失效、SEND_RESULT 匹配不上卡「发送中」、去重失效；esbuild 不做类型检查致静默通过 → 引入 tsc 门禁
+  - 新增 tsconfig.json + typescript/@types/chrome/@types/react，`npm test` = `tsc --noEmit && vitest run`；39 个存量类型错误清零（行为保持：instanceof 守卫/判别联合/补初值）
+  - 修 background 两个队列 bug：多 port 时 onDisconnect 无条件置空 panelPort（改为仅当前 port 断开才置空）；onConnect 冲刷队列与异步恢复竞态（queueReady 屏障，此前 SW 重启+侧栏快连会用空队列覆盖已持久化暂存=数据丢失）
+  - 更名 Pinpoint（用户弃「所指助手」）：manifest name/description、侧栏/选项页标题、package.json description、README；内部标识（CSS 类名/log 前缀/端口名/存储键/包名 dsh-point/挂载路径 /plugins/dsh-point/）保持不变以兼容已装实例
+  - 发布 GitHub 公开仓库 https://github.com/776138506/pinpoint（topic: dshplugin/dsh/chrome-extension/browser-extension）；CI（typecheck+vitest+双侧构建）首跑绿；Release 流水线（tag v* → 扩展 zip + dsh 插件 tgz）v0.1.0 实跑绿，双产物已下载校验内容
+  - 上传前审计：密钥 0 命中（2 处误报已核）、/Users/ 路径 2 处已改通用形式、数据文件为开发证据截图（测试页/公开站点）、.git 18M
+- 旧值：设置在侧栏内（L1/L2 分区）；快捷键录入无反馈；测试无类型门禁；品牌为 dsh-point 所指助手
+- 原因：用户指令——设置入插件设置页、按键即绑定、去分级字样、起好名字公开发布带 CI/CD
+- 验证：66/66 测试绿（含 tsc 前置）+ build 绿；ego 实机——选项页改地址 9999 侧栏热更「未连接」、恢复默认回 8897、快捷键四场景（单字母拒/修饰键提示/Ctrl+Shift+K 绑定/恢复默认）、确认即发 1.5s 内「已发送」、缓冲→重连冲刷→手动发送送达（dsh 侧 session title 证实）
+- 教训：esbuild 只转译不查类型，TS 项目必须有独立 tsc 门禁（本次 P0 即漏网）；YAML plain scalar 折叠会吞续行反斜杠，多行命令一律用块标量 `run: |`
+- 已知项：缓冲期 sendNow 标记重连后因会话列表未加载不自动补发，转为待发送需手点（排队清单）；github.com:443 本机间歇性被重置（api.github.com 正常），push 需重试循环
