@@ -180,3 +180,7 @@
 - 结论：顶栏文字来自 manifest.json name 字段（浏览器 chrome 渲染），更名提交后扩展未重载故仍是旧名；源码全仓 grep 已无「所指助手」残留
 - 处理：ego CDP 对扩展 service worker 执行 chrome.runtime.reload()，重开 sidepanel 验证 title=「Pinpoint 侧边栏」/ h1=Pinpoint；dsh 侧 UI 无显示包名的位置（可见文案为「所指/待发所指」标记物称呼），cordis.patch.yml 的 name 仅作 Loader 挂载标识，不动
 - 教训：浏览器扩展的 manifest 元信息（名称/图标/权限）改动后必须重载扩展才生效——交付含 manifest 变更的批次时，验收步骤要带「重载扩展」动作
+
+### 2026-08-24 ｜ 侧栏去重：移除面板内 h1
+- 变更：extension/sidepanel.html 删除 `<h1>Pinpoint</h1>` 及其 CSS——顶栏（manifest name 渲染）与面板标题重复
+- 验证：66/66 测试绿 + build 绿；ego 重载后 DOM 断言 h1=null、首元素为状态条，截图确认视觉
