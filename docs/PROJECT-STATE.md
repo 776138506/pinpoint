@@ -174,3 +174,9 @@
 - 验证：66/66 测试绿（含 tsc 前置）+ build 绿；ego 实机——选项页改地址 9999 侧栏热更「未连接」、恢复默认回 8897、快捷键四场景（单字母拒/修饰键提示/Ctrl+Shift+K 绑定/恢复默认）、确认即发 1.5s 内「已发送」、缓冲→重连冲刷→手动发送送达（dsh 侧 session title 证实）
 - 教训：esbuild 只转译不查类型，TS 项目必须有独立 tsc 门禁（本次 P0 即漏网）；YAML plain scalar 折叠会吞续行反斜杠，多行命令一律用块标量 `run: |`
 - 已知项：缓冲期 sendNow 标记重连后因会话列表未加载不自动补发，转为待发送需手点（排队清单）；github.com:443 本机间歇性被重置（api.github.com 正常），push 需重试循环
+
+### 2026-08-24 ｜ 扩展名称残留排查：非代码问题，是扩展未重载
+- 现象：用户截图侧栏顶栏仍显示「dsh-point 所指助手」，面板 h1 已是 Pinpoint
+- 结论：顶栏文字来自 manifest.json name 字段（浏览器 chrome 渲染），更名提交后扩展未重载故仍是旧名；源码全仓 grep 已无「所指助手」残留
+- 处理：ego CDP 对扩展 service worker 执行 chrome.runtime.reload()，重开 sidepanel 验证 title=「Pinpoint 侧边栏」/ h1=Pinpoint；dsh 侧 UI 无显示包名的位置（可见文案为「所指/待发所指」标记物称呼），cordis.patch.yml 的 name 仅作 Loader 挂载标识，不动
+- 教训：浏览器扩展的 manifest 元信息（名称/图标/权限）改动后必须重载扩展才生效——交付含 manifest 变更的批次时，验收步骤要带「重载扩展」动作
