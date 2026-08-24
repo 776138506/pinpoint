@@ -61,6 +61,15 @@ function connectPort(): void {
     port = null
     state.connected = false
     state.statusError = '与后台连接已断开，重连中…'
+    // 2026-08-24: 断开瞬间在飞的发送永远等不到 SEND_RESULT——卡「发送中」按钮永久
+    // 禁用。如实降级为 error（结果未知），让用户确认会话后手动重发，不自动重发
+    // （session.prompt 非幂等，静默重发会重复投递）
+    for (const item of state.outbox) {
+      if (item.status === 'sending') {
+        item.status = 'error'
+        item.error = '连接中断，发送结果未知，请确认会话后重试'
+      }
+    }
     updateUi()
     setTimeout(connectAndResync, 1000)
   })

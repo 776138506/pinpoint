@@ -133,6 +133,9 @@ function onMouseOver(e: MouseEvent): void {
 }
 
 function onMouseOut(e: MouseEvent): void {
+  // 2026-08-24: 与 onMouseOut 对称的失效守卫——旧实例（扩展重载后）若继续响应
+  // mouseout，会擦掉新实例刚画上的悬停高亮（双实例干扰）
+  if (!chrome.runtime?.id) return
   if (!state.marking) return
   const el = e.target as Element
   if (el === hoveredEl) { unhighlight(el); hoveredEl = null }
@@ -162,6 +165,7 @@ function onKeyDown(e: KeyboardEvent): void {
   if (!chrome.runtime?.id) return // 同上：失效旧实例静默
   if (e.key === 'Escape' && state.marking) {
     setMarking(false)
+    syncMarkingState()
     return
   }
   // 页面内自定义快捷键切换标记；内置组合由 manifest commands 接管，这里跳过防双重切换
@@ -169,10 +173,16 @@ function onKeyDown(e: KeyboardEvent): void {
     e.preventDefault()
     e.stopPropagation()
     setMarking(!state.marking)
-    // 同步侧栏按钮状态（content 路径不经过 background 的 TOGGLE_MARKING）
-    chrome.runtime.sendMessage({ type: 'MARKING_STATE_SYNC', marking: state.marking })
-      .catch((err) => console.error('[dsh-point-ext] marking state sync failed:', err))
+    syncMarkingState()
   }
+}
+
+// 2026-08-24: 页面内退出/切换（Esc、自定义快捷键）必须同步 background 的
+// 按 tab 跟踪与侧栏按钮——此前 Esc 退出不同步，侧栏按钮停在「退出标记」，
+// 再点反而把标记重新打开（状态撕裂）
+function syncMarkingState(): void {
+  chrome.runtime.sendMessage({ type: 'MARKING_STATE_SYNC', marking: state.marking })
+    .catch((err) => console.error('[dsh-point-ext] marking state sync failed:', err))
 }
 
 function onScrollOrResize(): void {

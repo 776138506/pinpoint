@@ -195,3 +195,13 @@
 - 原因：用户验收发现「支持页进入标记 → 进入不支持页无法退出」（留白缺口：不支持页无状态落点）
 - 验证：红灯复现 3/4 → 修复后 70/70 绿（含 tsc）+ build 绿。ego 端到端部分验证——content 标记/退出机制、面板↔background 消息链路实测通；但 ego 任务空间窗口拿不到 OS 焦点，chrome.tabs.query currentWindow 恒为用户窗口，面板点击→活动 tab 的完整回路无法决定性复现（依赖单元测试兜底）；调试期间曾误触用户窗口标记态，已全量广播 SET_MARKING false 清理
 - 教训：MV3 SW 空闲即死、长连 port 随之断——面板类 UI 必须有断线重连；ego 任务空间验证涉及「当前焦点窗口」语义的扩展 API 时有方法论盲区
+
+### 2026-08-24 ｜ 异常边界全面过堂：状态×事件矩阵枚举 + 4 缺口修复
+- 缺口与修复：
+  1. Esc 退出标记不同步 background/侧栏（页面内自定义快捷键有同步、Esc 漏了）→ 侧栏按钮停「退出标记」，再点反而重开（状态撕裂）。抽 syncMarkingState() 统一两条本地路径
+  2. content onMouseOut 缺 chrome.runtime.id 失效守卫（onMouseOver/onClick/onKeyDown 都有）→ 扩展重载后旧实例擦掉新实例的悬停高亮（双实例干扰）
+  3. port 断开瞬间在飞的发送永远等不到 SEND_RESULT → 卡「发送中」永久禁用。断开时 sending 项如实降级 error「连接中断，结果未知」，不自动重发（session.prompt 非幂等），用户确认后手动重发
+  4. 侧栏（重）连后标记按钮靠记忆值 → background 在 onConnect 时用 GET_STATE 探测活动 tab 真实标记态同步按钮（SW 重启丢 markingTabs / 断连期间用户 Esc 都能复归）
+- 测试：新增 content.spec.ts（jsdom，Esc 同步/快捷键同步/失效守卫 3 条）、sidepanel.spec.ts（jsdom，sending 降级/断线重连 2 条）、background.spec.ts 补 2 条（重连探态/探测失败不回推）；77/77 绿（含 tsc）+ build 绿
+- 枚举后判定为「已有覆盖」的边界（抽查确认）：捕获时了结旧草稿/退出标记了结草稿/关闭草稿窗即撤销（高亮⇔暂存不变量）、截图超时降级纯文本、发送看门狗、点已标记元素重开评论、捕获防抖 captureInFlight、popupBusy 防双击、暂存区跨 tab 删除/清空、FOCUS_MARK 页面已导航如实报错、SPA 导航标记保留+角标隐藏
+- 已知不改项：截图异步期间退出标记仍会弹评论窗（与「角标点击开评论」同语义，非缺陷）；跨域 iframe 内元素不可标记（manifest 未开 all_frames，边界有意）；旧实例内联 outline 无法枚举清理（随刷新消失）

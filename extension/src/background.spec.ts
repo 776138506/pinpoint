@@ -187,3 +187,31 @@ describe('标记态在不支持页面的复归（2026-08-24 bug）', () => {
     expect(after.at(-1)).toMatchObject({ marking: false })
   })
 })
+
+describe('侧栏（重）连时探测活动 tab 真实标记态（2026-08-24）', () => {
+  it('探到标记中 → 侧栏按钮同步为退出标记', async () => {
+    const h = setup()
+    h.sendMessage.mockResolvedValue({ marking: true }) // GET_STATE 响应
+    await import('./background.ts')
+    h.fireConnect()
+    await flush()
+    const states = h.portMessages.filter((m) => (m as { type?: string }).type === 'MARKING_STATE')
+    expect(states.at(-1)).toMatchObject({ marking: true })
+    // 探测结果进跟踪表：随后整页导航应出清并回推 false
+    h.portMessages.length = 0
+    h.fireTabUpdated(7, { status: 'loading', url: 'chrome://version' })
+    await flush()
+    const after = h.portMessages.filter((m) => (m as { type?: string }).type === 'MARKING_STATE')
+    expect(after.at(-1)).toMatchObject({ marking: false })
+  })
+
+  it('活动页无 content script（不支持页）→ 探测失败不回推，保持默认', async () => {
+    const h = setup()
+    h.sendMessage.mockRejectedValue(new Error('Receiving end does not exist'))
+    await import('./background.ts')
+    h.fireConnect()
+    await flush()
+    const states = h.portMessages.filter((m) => (m as { type?: string }).type === 'MARKING_STATE')
+    expect(states).toHaveLength(0)
+  })
+})

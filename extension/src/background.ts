@@ -234,6 +234,21 @@ chrome.runtime.onConnect.addListener((port) => {
   checkConnection()
     .then(status => postToPanel({ type: 'STATUS', ...status }))
     .catch(e => postToPanel({ type: 'STATUS', connected: false, error: String(e) }))
+  // 2026-08-24: 侧栏（重）连后探一次活动 tab 的真实标记态（GET_STATE），
+  // 按钮不依赖记忆值——SW 重启丢 markingTabs、断连期间用户 Esc 退出都能复归
+  void (async () => {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+      if (!tab?.id) return
+      const s = await chrome.tabs.sendMessage(tab.id, { type: 'GET_STATE' }) as { marking?: boolean }
+      if (typeof s?.marking === 'boolean') {
+        setTabMarking(tab.id, s.marking)
+        postToPanel({ type: 'MARKING_STATE', marking: s.marking })
+      }
+    } catch {
+      // 活动页无 content script（不支持页/未注入）→ 视为未标记，不回推（保持默认）
+    }
+  })()
   // 冲刷侧栏关闭期间缓冲的标记（等恢复完成再冲，见 queueReady 注释）
   void queueReady.then(() => {
     while (stagedQueue.length > 0) {
