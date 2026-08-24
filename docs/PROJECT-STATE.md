@@ -22,6 +22,17 @@
 - （无）
 
 ## 变更日志（纯增量，唯一的历史通道）
+### 2026-08-24 ｜ 区域框选标记（engine + 扩展 content）
+- 变更：
+  - `src/client/engine.ts` 增加区域框选：标记模式下 mousedown 开始拖拽，移动 >6px 时绘制选区矩形，mouseup 捕获为 `region:x,y,w,h` 标记；≤6px 视为点击继续走元素捕获；拖拽中 Esc 取消；新增 `.dsh-point-region-rect`/`.dsh-point-region-kept` 样式；`resolveMarkElement`/`markViewportRect`/`renderBadges`/`repositionBadges`/`repositionPopup` 覆盖 region 分支，支持持久边框与角标/弹窗定位。
+  - `extension/src/content.ts` 同步实现扩展侧区域框选与持久边框；`FOCUS_MARK` 对 region 滚动并闪烁边框；增加 `scrollIntoView` 运行时存在性判断以兼容 jsdom。
+  - 新增 `src/client/engine.spec.ts`（6 例）：覆盖 >6px region 捕获、≤6px 元素捕获、Esc 取消、overlay 起点不触发、region 渲染/定位分支。
+  - 扩展 `extension/src/content.spec.ts`（5 例）：覆盖同样规格 + FOCUS_MARK region 闪烁。
+- 旧值：仅支持点选元素，无法框选任意区域；无 region selector 及相关渲染分支。
+- 原因：用户已确认设计——区域框选用于图片/图表/非文本块的精准所指。
+- 验证：`npm test` = `tsc --noEmit && vitest run` 101/101 绿；`npm run build` 绿。
+- 已知项/教训：jsdom 不会自动合成 click，≤6px 测试需显式 dispatch `click`；content.ts 模块级 mount 导致多用例间残留 DOM，region 闪烁断言改用组合类名 `.dsh-point-ext-region-kept.dsh-point-ext-flash`；iframe 内区域坐标沿用 iframe 文档坐标，已在注释中说明。
+
 ### 2026-08-21 ｜ 测试加固 + ocr 审查修复（schema/mark-utils/shortcut/扩展三文件）
 - 变更：
   - 扩展 schema 边界测试：`src/schema/mark-format.spec.ts` 从 13 例增至 27 例，覆盖非法 JSON、缺必填字段、未知字段透传/拒绝行为、version 不匹配、`parseMarkText` 空串/畸形 fence/JSON 数组与原始值/嵌套 fence、`extractReferents` 重复 payload/空锚点/与畸形块共存。

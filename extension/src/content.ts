@@ -21,6 +21,9 @@ const POPUP_LAYER_ID = 'dsh-point-ext-popup-layer'
 const KEPT_FLAG = '__dshPointExtKept'
 const HOVER_OUTLINE = '2px solid #ff2d55'
 const KEPT_OUTLINE = '2px solid #2563eb'
+const REGION_RECT_CLASS = 'dsh-point-ext-region-rect'
+const REGION_KEPT_CLASS = 'dsh-point-ext-region-kept'
+const DRAG_THRESHOLD = 6
 
 interface ContentState {
   marking: boolean
@@ -37,6 +40,19 @@ let rafPending = false
 let popupBusy = false
 let lastHintAt = 0
 let captureInFlight = false
+
+// 2026-08-24: region drag state. mousedown starts a drag; mousemove beyond
+// DRAG_THRESHOLD draws the selection rect; mouseup either captures the region
+// (if dragged) or falls through to the click handler (if not). Esc cancels drag.
+let dragStartX = 0
+let dragStartY = 0
+let isDragging = false
+let dragRectEl: HTMLElement | null = null
+let suppressClick = false
+
+// 2026-08-24: region marks have no DOM element, so we keep a persistent
+// border div per mark that follows scroll/resize via repositionAll().
+const regionEls = new Map<number, HTMLElement>()
 
 // 2026-08-20: 页面内自定义快捷键（侧栏设置区配置，chrome.storage 共享）。
 // 等于内置 Alt+Shift+M 时不处理——该组合由 manifest commands 全局接管，避免双重切换
@@ -123,6 +139,8 @@ function onMouseOver(e: MouseEvent): void {
   // 旧实例必须静默，否则与按需注入的新实例双重触发
   if (!chrome.runtime?.id) return
   if (!state.marking) return
+  // 2026-08-24: 拖拽期间不画悬停高亮，避免选区矩形与 hover outline 叠加。
+  if (isDragging) return
   const el = e.target as Element
   if (!el || el.nodeType !== 1) return
   if ((el as Element).closest(OWN_UI_SELECTOR)) return
@@ -141,9 +159,69 @@ function onMouseOut(e: MouseEvent): void {
   if (el === hoveredEl) { unhighlight(el); hoveredEl = null }
 }
 
+function onMouseDown(e: MouseEvent): void {
+  if (!chrome.runtime?.id) return
+  if (!state.marking) return
+  const el = e.target as Element
+  if (!el || el.nodeType !== 1) return
+  if ((el as Element).closest(OWN_UI_SELECTOR)) return
+  dragStartX = e.clientX
+  dragStartY = e.clientY
+  isDragging = true
+}
+
+function onMouseMove(e: MouseEvent): void {
+  if (!chrome.runtime?.id) return
+  if (!state.marking || !isDragging) return
+  const dx = e.clientX - dragStartX
+  const dy = e.clientY - dragStartY
+  if (Math.hypot(dx, dy) <= DRAG_THRESHOLD) return
+  // 2026-08-24: 拖拽中阻止文本选择，避免页面内容被高亮。
+  e.preventDefault()
+  if (dragRectEl === null) {
+    dragRectEl = document.createElement('div')
+    dragRectEl.className = REGION_RECT_CLASS
+    document.body.appendChild(dragRectEl)
+  }
+  const left = Math.min(dragStartX, e.clientX) + window.scrollX
+  const top = Math.min(dragStartY, e.clientY) + window.scrollY
+  dragRectEl.style.left = `${left}px`
+  dragRectEl.style.top = `${top}px`
+  dragRectEl.style.width = `${Math.abs(dx)}px`
+  dragRectEl.style.height = `${Math.abs(dy)}px`
+}
+
+function onMouseUp(e: MouseEvent): void {
+  if (!chrome.runtime?.id) return
+  if (!state.marking || !isDragging) return
+  const dx = e.clientX - dragStartX
+  const dy = e.clientY - dragStartY
+  const dragged = Math.hypot(dx, dy) > DRAG_THRESHOLD
+  if (dragRectEl !== null) { dragRectEl.remove(); dragRectEl = null }
+  isDragging = false
+  if (dragged) {
+    suppressClick = true
+    const left = Math.min(dragStartX, e.clientX) + window.scrollX
+    const top = Math.min(dragStartY, e.clientY) + window.scrollY
+    const rect = {
+      x: Math.round(left),
+      y: Math.round(top),
+      width: Math.round(Math.abs(dx)),
+      height: Math.round(Math.abs(dy)),
+    }
+    void captureRegion(rect)
+  }
+}
+
 function onClick(e: MouseEvent): void {
   if (!chrome.runtime?.id) return // 同上：失效旧实例静默
   if (!state.marking) return
+  // 2026-08-24: a region drag consumes the click; do not also capture the
+  // element under the mouseup.
+  if (suppressClick) {
+    suppressClick = false
+    return
+  }
   const el = e.target as Element
   if (!el || el.nodeType !== 1) return
   if ((el as Element).closest(OWN_UI_SELECTOR)) return
@@ -165,6 +243,11 @@ function onKeyDown(e: KeyboardEvent): void {
   if (!chrome.runtime?.id) return // 同上：失效旧实例静默
   if (e.repeat) return // 2026-08-24: 长按 repeat 会反复 toggle 标记态，只认第一次
   if (e.key === 'Escape' && state.marking) {
+    if (isDragging) {
+      isDragging = false
+      if (dragRectEl !== null) { dragRectEl.remove(); dragRectEl = null }
+      return
+    }
     setMarking(false)
     syncMarkingState()
     return
@@ -278,6 +361,61 @@ async function captureElement(el: Element): Promise<void> {
   }
 }
 
+async function captureRegion(rect: { x: number; y: number; width: number; height: number }): Promise<void> {
+  if (captureInFlight) return
+  captureInFlight = true
+  try {
+    await captureRegionInner(rect)
+  } finally {
+    captureInFlight = false
+  }
+}
+
+async function captureRegionInner(rect: { x: number; y: number; width: number; height: number }): Promise<void> {
+  settleDraft()
+  const mark: Mark = {
+    index: state.nextIndex,
+    selector: `region:${rect.x},${rect.y},${rect.width},${rect.height}`,
+    text: '',
+    html: '',
+    source: document.title || '页面',
+    sourceUrl: location.href,
+    sourceTitle: document.title,
+    frameKind: 'main',
+    screenshot: '',
+    hasExternalImage: false,
+    time: new Date().toISOString(),
+    status: 'draft',
+    anchor: { rect },
+  }
+
+  try {
+    const canvas = await Promise.race([
+      html2canvas(document.documentElement, {
+        backgroundColor: '#ffffff',
+        scale: 1,
+        logging: false,
+        useCORS: true,
+        allowTaint: false,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+      }),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`截图超时（${extSettings.screenshotTimeoutMs}ms）`)), extSettings.screenshotTimeoutMs)),
+    ])
+    mark.screenshot = canvas.toDataURL('image/png')
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e)
+    console.error('[dsh-point-ext] region screenshot failed:', e)
+    mark.screenshotError = reason
+    showToast(`截图失败：${reason}。仍可发送纯文本所指。`)
+  }
+
+  addMark(mark)
+  openMark(mark.index)
+}
+
 /* ---------- state ---------- */
 
 function setState(next: ContentState): void {
@@ -377,7 +515,11 @@ function renderBadges(): void {
   const wanted = new Set(state.marks.map(m => m.index))
   for (const badge of Array.from(layer.children)) {
     const index = Number((badge as HTMLElement).dataset.index)
-    if (!wanted.has(index)) badge.remove()
+    if (!wanted.has(index)) {
+      const border = regionEls.get(index)
+      if (border) { border.remove(); regionEls.delete(index) }
+      badge.remove()
+    }
   }
   for (const mark of state.marks) {
     let badge = layer.querySelector<HTMLElement>(`.dsh-point-ext-badge[data-index="${mark.index}"]`)
@@ -395,6 +537,22 @@ function renderBadges(): void {
     badge.classList.toggle('sent', mark.status === 'sent')
     badge.classList.toggle('pending', mark.status === 'pending')
     badge.title = mark.status === 'sent' ? '已发送' : '点击打开评论'
+    const regionRect = parseRegionSelector(mark.selector)
+    if (regionRect !== null) {
+      let border = regionEls.get(mark.index)
+      if (border === undefined) {
+        border = document.createElement('div')
+        border.className = REGION_KEPT_CLASS
+        border.dataset.index = String(mark.index)
+        document.body.appendChild(border)
+        regionEls.set(mark.index, border)
+      }
+      border.style.left = `${regionRect.x}px`
+      border.style.top = `${regionRect.y}px`
+      border.style.width = `${regionRect.width}px`
+      border.style.height = `${regionRect.height}px`
+      continue
+    }
     const el = resolveElement(mark)
     if (el !== null && el instanceof HTMLElement) {
       const rec = el as HTMLElement & { __dshPointExtOrigOutline?: string; __dshPointExtOrigOutlineOffset?: string }
@@ -415,6 +573,13 @@ function repositionBadges(): void {
   for (const mark of state.marks) {
     const badge = overlay.querySelector<HTMLElement>(`.dsh-point-ext-badge[data-index="${mark.index}"]`)
     if (badge === null) continue
+    const regionRect = parseRegionSelector(mark.selector)
+    if (regionRect !== null) {
+      badge.style.display = ''
+      badge.style.left = `${regionRect.x - window.scrollX}px`
+      badge.style.top = `${regionRect.y - window.scrollY}px`
+      continue
+    }
     const el = resolveElement(mark)
     if (el === null || !el.isConnected) {
       badge.style.display = 'none'
@@ -425,6 +590,15 @@ function repositionBadges(): void {
     badge.style.left = `${r.left}px`
     badge.style.top = `${r.top}px`
   }
+}
+
+function parseRegionSelector(selector: string): { x: number; y: number; width: number; height: number } | null {
+  const m = /^region:(-?\d+),(-?\d+),(\d+),(\d+)$/.exec(selector)
+  if (!m) return null
+  const [, xs, ys, ws, hs] = m
+  const rect = { x: Number(xs), y: Number(ys), width: Number(ws), height: Number(hs) }
+  if (rect.width <= 0 || rect.height <= 0) return null
+  return rect
 }
 
 function resolveElement(mark: Mark): Element | null {
@@ -438,9 +612,27 @@ function resolveElement(mark: Mark): Element | null {
 
 // 2026-08-21: 从暂存列表跳转定位——selector 失效时回退 anchor.xpath，
 // 滚动到视口中央并闪烁提醒（box-shadow 脉冲，不与 KEPT_OUTLINE 内联 outline 冲突）
+// 2026-08-24: 新增 region 标记分支——滚动到矩形位置并闪烁区域边框。
 function focusMark(index: number): { ok: boolean; error?: string } {
   const mark = state.marks.find(m => m.index === index)
   if (!mark) return { ok: false, error: '页面上不存在该标记（可能已删除或页面已刷新）' }
+
+  const regionRect = parseRegionSelector(mark.selector)
+  if (regionRect !== null) {
+    const border = regionEls.get(mark.index)
+    if (!border) return { ok: false, error: '无法定位区域标记（页面已刷新）' }
+    // jsdom 没有 scrollIntoView；运行时判断，避免测试崩溃。
+    if (typeof border.scrollIntoView === 'function') {
+      border.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    }
+    const cls = 'dsh-point-ext-flash'
+    border.classList.remove(cls)
+    void border.offsetWidth
+    border.classList.add(cls)
+    window.setTimeout(() => { border.classList.remove(cls) }, 1800)
+    return { ok: true }
+  }
+
   let el = resolveElement(mark)
   if (el === null && mark.anchor?.xpath) {
     try {
@@ -451,7 +643,9 @@ function focusMark(index: number): { ok: boolean; error?: string } {
     }
   }
   if (el === null || !el.isConnected) return { ok: false, error: '无法定位标记元素（页面结构已变化）' }
-  el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  if (typeof (el as HTMLElement).scrollIntoView === 'function') {
+    (el as HTMLElement).scrollIntoView({ block: 'center', behavior: 'smooth' })
+  }
   const cls = 'dsh-point-ext-flash'
   el.classList.remove(cls)
   // 强制 reflow：连续点击同一标记也能重新触发动画
@@ -622,13 +816,27 @@ function repositionPopup(): void {
   if (container === null) return
   const mark = state.marks.find(m => m.index === state.activeIndex)
   if (mark === undefined) return
-  const el = resolveElement(mark)
-  if (el === null || !el.isConnected) {
-    container.style.display = 'none'
-    return
+
+  let r: { left: number; top: number; bottom: number; width: number }
+  const regionRect = parseRegionSelector(mark.selector)
+  if (regionRect !== null) {
+    r = {
+      left: regionRect.x - window.scrollX,
+      top: regionRect.y - window.scrollY,
+      bottom: regionRect.y + regionRect.height - window.scrollY,
+      width: regionRect.width,
+    }
+  } else {
+    const el = resolveElement(mark)
+    if (el === null || !el.isConnected) {
+      container.style.display = 'none'
+      return
+    }
+    const rect = el.getBoundingClientRect()
+    r = { left: rect.left, top: rect.top, bottom: rect.bottom, width: rect.width }
   }
+
   container.style.display = ''
-  const r = el.getBoundingClientRect()
   const pad = 8
   let top = r.bottom + pad
   let left = r.left
@@ -773,6 +981,20 @@ body.dsh-point-ext-marking .dsh-point-ext-badge { cursor: pointer; }
   50% { box-shadow: 0 0 0 8px rgba(255, 45, 85, 0.45); }
 }
 .dsh-point-ext-flash { animation: dshPointExtFlash 0.5s ease-in-out 3; }
+.dsh-point-ext-region-rect {
+  position: absolute;
+  border: 2px dashed #2563eb;
+  background: rgba(37, 99, 235, 0.08);
+  pointer-events: none;
+  z-index: 2147483000;
+}
+.dsh-point-ext-region-kept {
+  position: absolute;
+  border: 2px dashed #2563eb;
+  background: rgba(37, 99, 235, 0.04);
+  pointer-events: none;
+  z-index: 2147482999;
+}
 `
   document.head.appendChild(style)
 }
@@ -783,11 +1005,14 @@ function mount(): void {
   // 2026-08-21: 扩展重载后按需注入的新实例会撞见旧实例残留 DOM（角标/弹窗层，同 id）。
   // mount 时清掉，避免双 overlay 与僵尸角标。ponytail: 旧实例留在元素上的内联 outline
   // 无法枚举（JS 属性不可查询），随页面刷新自然消失，不另做清理
-  for (const stale of document.querySelectorAll('.dsh-point-ext-overlay, .dsh-point-ext-popup-layer, .dsh-point-ext-toast')) {
+  for (const stale of document.querySelectorAll('.dsh-point-ext-overlay, .dsh-point-ext-popup-layer, .dsh-point-ext-toast, .dsh-point-ext-region-kept')) {
     stale.remove()
   }
   document.addEventListener('mouseover', onMouseOver, true)
   document.addEventListener('mouseout', onMouseOut, true)
+  document.addEventListener('mousedown', onMouseDown, true)
+  document.addEventListener('mousemove', onMouseMove, true)
+  document.addEventListener('mouseup', onMouseUp, true)
   document.addEventListener('click', onClick, true)
   document.addEventListener('keydown', onKeyDown, true)
   document.addEventListener('scroll', onScrollOrResize, true)

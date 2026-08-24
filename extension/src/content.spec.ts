@@ -9,6 +9,26 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+const FAKE_SCREENSHOT = 'data:image/png;base64,fake'
+
+vi.mock('html2canvas', () => ({
+  default: vi.fn(async (_el: unknown, opts?: Record<string, unknown>) => {
+    const canvas = document.createElement('canvas')
+    if (opts && typeof opts.width === 'number' && typeof opts.height === 'number') {
+      canvas.width = opts.width as number
+      canvas.height = opts.height as number
+    } else {
+      canvas.width = 100
+      canvas.height = 100
+    }
+    return {
+      toDataURL: () => FAKE_SCREENSHOT,
+      width: canvas.width,
+      height: canvas.height,
+    }
+  }),
+}))
+
 type MessageListener = (message: unknown, sender: unknown, sendResponse: (r?: unknown) => void) => boolean
 
 interface Harness {
@@ -147,5 +167,155 @@ describe('双实例干扰守卫（扩展重载场景）', () => {
     el.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }))
     // 失效实例必须静默——高亮保留（由新实例全权管理）
     expect(el.style.outline).toContain('#ff2d55')
+  })
+})
+
+function dispatchMouseSequence(
+  target: HTMLElement,
+  events: Array<{ type: 'mousedown' | 'mousemove' | 'mouseup' | 'click'; clientX: number; clientY: number }>,
+): void {
+  for (const ev of events) {
+    target.dispatchEvent(new MouseEvent(ev.type, {
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      bubbles: true,
+    }))
+  }
+}
+
+async function flushAsync(): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, 0))
+}
+
+describe('扩展侧区域框选（2026-08-24）', () => {
+  it('拖拽 > 6px 生成 region mark（本地草稿，未自动暂存）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const target = document.createElement('div')
+    target.style.width = '500px'
+    target.style.height = '500px'
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 10, clientY: 20 },
+      { type: 'mousemove', clientX: 40, clientY: 60 },
+      { type: 'mouseup', clientX: 40, clientY: 60 },
+    ])
+    await flushAsync()
+
+    // 捕获只生成本地草稿；暂存/发送需要用户在弹窗里点按钮，不会自动 STAGE_MARK。
+    const stageCalls = h.sendMessage.mock.calls.filter(
+      c => (c[0] as { type?: string }).type === 'STAGE_MARK',
+    )
+    expect(stageCalls).toHaveLength(0)
+
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ selector: string; text: string; screenshotLen: number; hasExternalImage: boolean; status: string }> }
+    expect(s.marks).toHaveLength(1)
+    expect(s.marks[0]!.selector).toMatch(/^region:10,20,30,40$/)
+    expect(s.marks[0]!.text).toBe('')
+    expect(s.marks[0]!.screenshotLen).toBeGreaterThan(0)
+    expect(s.marks[0]!.hasExternalImage).toBe(false)
+    expect(s.marks[0]!.status).toBe('draft')
+  })
+
+  it('拖拽 ≤ 6px 走点击元素捕获', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const target = document.createElement('div')
+    target.id = 'ext-target'
+    target.textContent = 'ext'
+    target.style.width = '500px'
+    target.style.height = '500px'
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 100, clientY: 100 },
+      { type: 'mousemove', clientX: 103, clientY: 105 },
+      { type: 'mouseup', clientX: 103, clientY: 105 },
+      { type: 'click', clientX: 103, clientY: 105 },
+    ])
+    await flushAsync()
+
+    const stageCalls = h.sendMessage.mock.calls.filter(
+      c => (c[0] as { type?: string }).type === 'STAGE_MARK',
+    )
+    expect(stageCalls).toHaveLength(0)
+
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ selector: string; text: string; status: string }> }
+    expect(s.marks).toHaveLength(1)
+    expect(s.marks[0]!.selector).toBe('#ext-target')
+    expect(s.marks[0]!.text).toBe('ext')
+    expect(s.marks[0]!.status).toBe('draft')
+  })
+
+  it('拖拽中 Esc 取消，不产出 mark', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const target = document.createElement('div')
+    target.style.width = '500px'
+    target.style.height = '500px'
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 0, clientY: 0 },
+      { type: 'mousemove', clientX: 100, clientY: 100 },
+    ])
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    dispatchMouseSequence(target, [
+      { type: 'mouseup', clientX: 100, clientY: 100 },
+    ])
+
+    const stageCalls = h.sendMessage.mock.calls.filter(
+      c => (c[0] as { type?: string }).type === 'STAGE_MARK',
+    )
+    expect(stageCalls).toHaveLength(0)
+    expect(document.body.classList.contains('dsh-point-ext-marking')).toBe(true)
+    expect(document.querySelector('.dsh-point-ext-region-rect')).toBeNull()
+  })
+
+  it('起始于 badge 不触发框选', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const badge = document.createElement('div')
+    badge.className = 'dsh-point-ext-badge'
+    document.body.appendChild(badge)
+
+    dispatchMouseSequence(badge, [
+      { type: 'mousedown', clientX: 0, clientY: 0 },
+      { type: 'mousemove', clientX: 100, clientY: 100 },
+      { type: 'mouseup', clientX: 100, clientY: 100 },
+    ])
+
+    const stageCalls = h.sendMessage.mock.calls.filter(
+      c => (c[0] as { type?: string }).type === 'STAGE_MARK',
+    )
+    expect(stageCalls).toHaveLength(0)
+  })
+
+  it('FOCUS_MARK 对 region 滚动并闪烁边框', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const target = document.createElement('div')
+    target.style.width = '500px'
+    target.style.height = '500px'
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 10, clientY: 10 },
+      { type: 'mousemove', clientX: 60, clientY: 60 },
+      { type: 'mouseup', clientX: 60, clientY: 60 },
+    ])
+    await flushAsync()
+
+    const res = h.fireMessage({ type: 'FOCUS_MARK', index: 1 }) as { ok: boolean }
+    expect(res.ok).toBe(true)
+    // 跨实例残留边框可能让 querySelector 拿到不带 flash 的 stale 元素，直接查组合类名。
+    const border = document.querySelector('.dsh-point-ext-region-kept.dsh-point-ext-flash')
+    expect(border).not.toBeNull()
   })
 })

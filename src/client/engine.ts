@@ -42,6 +42,9 @@ const KEPT_OUTLINE = '2px solid #2563eb'
 const OVERLAY_ID = 'dsh-point-badge-layer'
 const CROSS_ID = 'dsh-point-cross-layer'
 const STYLE_ID = 'dsh-point-style'
+const REGION_RECT_CLASS = 'dsh-point-region-rect'
+const REGION_KEPT_CLASS = 'dsh-point-region-kept'
+const DRAG_THRESHOLD = 6
 
 // Element data attributes written by the engine (never read back for logic
 // beyond the flags that prevent double-highlighting a kept mark).
@@ -73,6 +76,24 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
   // captures concurrently against the same state.nextIndex, producing duplicate
   // marks sharing one index.
   let captureInFlight = false
+
+  // 2026-08-24: region drag state. mousedown starts a drag; mousemove beyond
+  // DRAG_THRESHOLD draws the selection rect; mouseup either captures the region
+  // (if dragged) or falls through to the click handler (if not).
+  interface DragState {
+    startX: number
+    startY: number
+    doc: Document
+    frame?: HTMLIFrameElement
+    officeContainer?: HTMLElement
+  }
+  let dragState: DragState | null = null
+  let dragRectEl: HTMLElement | null = null
+  let suppressClick = false
+
+  // 2026-08-24: region marks have no DOM element, so we keep a persistent
+  // border div per mark that follows scroll/resize via repositionAll().
+  const regionEls = new Map<number, HTMLElement>()
 
   ensureStyle()
 
@@ -129,6 +150,83 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     if (hoveredEl) { unhighlight(hoveredEl); hoveredEl = null }
   }
 
+  /* ---------- region drag ---------- */
+
+  // 2026-08-24: exclude the engine's own UI from starting a region drag, so
+  // users can still interact with badges/popups/toasts/cross notices.
+  function isOwnUI(el: Element): boolean {
+    return el.closest(
+      '.dsh-point-badge, .dsh-point-toast, .dsh-point-cross, .dsh-point-popup, .dsh-point-popup-layer, .dsh-point-region-rect, .dsh-point-region-kept',
+    ) !== null
+  }
+
+  function startDrag(e: MouseEvent, doc: Document, frame?: HTMLIFrameElement): void {
+    const el = e.target as Element
+    if (!el || el.nodeType !== 1) return
+    if (isOwnUI(el)) return
+    const officeContainer = !frame ? (el.closest('div[data-office]') as HTMLElement | null) ?? undefined : undefined
+    dragState = { startX: e.clientX, startY: e.clientY, doc, frame, officeContainer }
+  }
+
+  function updateDrag(e: MouseEvent): void {
+    if (!dragState) return
+    const dx = e.clientX - dragState.startX
+    const dy = e.clientY - dragState.startY
+    if (Math.hypot(dx, dy) <= DRAG_THRESHOLD) {
+      removeDragRect()
+      return
+    }
+    // 2026-08-24: 拖拽中阻止文本选择，避免页面内容被高亮。
+    e.preventDefault()
+    const doc = dragState.doc
+    const win = doc.defaultView
+    const left = Math.min(dragState.startX, e.clientX) + (win?.scrollX ?? 0)
+    const top = Math.min(dragState.startY, e.clientY) + (win?.scrollY ?? 0)
+    const width = Math.abs(dx)
+    const height = Math.abs(dy)
+    if (dragRectEl === null) {
+      dragRectEl = document.createElement('div')
+      dragRectEl.className = REGION_RECT_CLASS
+      // Append to the document being marked so coordinates are 1:1 and the
+      // rect scrolls with the content.
+      doc.body.appendChild(dragRectEl)
+    }
+    dragRectEl.style.left = `${left}px`
+    dragRectEl.style.top = `${top}px`
+    dragRectEl.style.width = `${width}px`
+    dragRectEl.style.height = `${height}px`
+  }
+
+  function endDrag(e: MouseEvent): void {
+    if (!dragState) return
+    const dx = e.clientX - dragState.startX
+    const dy = e.clientY - dragState.startY
+    const dragged = Math.hypot(dx, dy) > DRAG_THRESHOLD
+    removeDragRect()
+    if (dragged) {
+      suppressClick = true
+      const doc = dragState.doc
+      const win = doc.defaultView
+      const left = Math.min(dragState.startX, e.clientX) + (win?.scrollX ?? 0)
+      const top = Math.min(dragState.startY, e.clientY) + (win?.scrollY ?? 0)
+      const rect = {
+        x: Math.round(left),
+        y: Math.round(top),
+        width: Math.round(Math.abs(dx)),
+        height: Math.round(Math.abs(dy)),
+      }
+      void captureRegion(rect, dragState.frame, dragState.officeContainer)
+    }
+    dragState = null
+  }
+
+  function removeDragRect(): void {
+    if (dragRectEl !== null) {
+      dragRectEl.remove()
+      dragRectEl = null
+    }
+  }
+
   /* ---------- frame listeners ---------- */
 
   /**
@@ -165,8 +263,26 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
       const el = e.target as Element
       if (el === hoveredEl) { unhighlight(el); hoveredEl = null }
     }, true)
+    doc.addEventListener('mousedown', (e: MouseEvent) => {
+      if (!state.marking) return
+      startDrag(e, doc, frame)
+    }, true)
+    doc.addEventListener('mousemove', (e: MouseEvent) => {
+      if (!state.marking) return
+      updateDrag(e)
+    }, true)
+    doc.addEventListener('mouseup', (e: MouseEvent) => {
+      if (!state.marking) return
+      endDrag(e)
+    }, true)
     doc.addEventListener('click', (e: MouseEvent) => {
       if (!state.marking) return
+      // 2026-08-24: a region drag consumes the click; do not also capture the
+      // element under the mouseup.
+      if (suppressClick) {
+        suppressClick = false
+        return
+      }
       // D10: iframe-local coordinates feed elementFromPoint directly.
       const raw = doc.elementFromPoint(e.clientX, e.clientY) ?? e.target
       if (!(raw instanceof Element)) return
@@ -179,6 +295,19 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     }, true)
     // Iframe-internal scroll must reposition the parent-page badges.
     doc.addEventListener('scroll', onScrollOrResize, true)
+    // 2026-08-24: Esc 落点补齐——焦点在预览 iframe 内时，按键事件只进 iframe 文档，
+    // 主文档的 keydown 听不到，标记模式无法退出（侧栏按钮卡「退出标记」）
+    // 拖拽中按 Esc 取消本次拖拽（不退出标记模式）；非拖拽状态 Esc 退出标记。
+    doc.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.repeat) return
+      if (e.key !== 'Escape' || !state.marking) return
+      if (dragState !== null) {
+        dragState = null
+        removeDragRect()
+        return
+      }
+      deps.setMarking(false)
+    }, true)
   }
 
   function tryAttachContent(frame: HTMLIFrameElement): void {
@@ -269,6 +398,7 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
 
   function onOfficeClick(e: MouseEvent): void {
     if (!state.marking) return
+    if (suppressClick) { suppressClick = false; return }
     const el = e.target as Element
     if (!el || el.nodeType !== 1) return
     if ((el as Element).closest('.dsh-point-badge, .dsh-point-toast, .dsh-point-cross')) return
@@ -398,6 +528,91 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     }
   }
 
+  async function captureRegion(
+    rect: { x: number; y: number; width: number; height: number },
+    frame: HTMLIFrameElement | undefined,
+    officeContainer: HTMLElement | undefined,
+  ): Promise<void> {
+    if (captureInFlight) return
+    captureInFlight = true
+    try {
+      await captureRegionInner(rect, frame, officeContainer)
+    } finally {
+      captureInFlight = false
+    }
+  }
+
+  async function captureRegionInner(
+    rect: { x: number; y: number; width: number; height: number },
+    frame: HTMLIFrameElement | undefined,
+    officeContainer: HTMLElement | undefined,
+  ): Promise<void> {
+    let frameKind: 'iframe' | 'office' | 'main' = 'main'
+    let source = '页面'
+    let frameTitle: string | undefined
+    let captureDoc: Document = document
+    if (frame !== undefined) {
+      frameKind = 'iframe'
+      frameTitle = frame.title || frame.getAttribute('title') || '网页预览'
+      source = frameTitle
+      try {
+        const d = frame.contentDocument
+        if (d !== null) captureDoc = d
+      } catch (e) {
+        console.error('[dsh-point] region capture iframe access failed:', e)
+      }
+    } else if (officeContainer !== undefined) {
+      frameKind = 'office'
+      source = officeContainer.getAttribute('data-office') || 'office'
+    }
+
+    const mark: Mark = {
+      index: state.nextIndex,
+      selector: `region:${rect.x},${rect.y},${rect.width},${rect.height}`,
+      text: '',
+      html: '',
+      source,
+      sourceUrl: frameKind === 'iframe' && frame !== undefined
+        ? (frame.contentWindow?.location.href ?? undefined)
+        : (document.defaultView?.location.href ?? undefined),
+      sourceTitle: frameKind === 'iframe' && frameTitle !== undefined
+        ? frameTitle
+        : (document.defaultView?.document.title ?? source),
+      frameKind,
+      frameTitle,
+      screenshot: '',
+      hasExternalImage: false,
+      time: new Date().toISOString(),
+      status: 'draft',
+      anchor: { rect },
+    }
+
+    try {
+      if (typeof html2canvas !== 'function') {
+        throw new Error('html2canvas 不可用（未随 client bundle 打包）')
+      }
+      const canvas = await html2canvas(captureDoc.documentElement, {
+        backgroundColor: '#ffffff',
+        scale: 1,
+        logging: false,
+        useCORS: true,
+        allowTaint: false,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+      })
+      mark.screenshot = canvas.toDataURL('image/png')
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e)
+      console.error('[dsh-point] 区域截图失败:', e)
+      mark.screenshotError = reason
+      showToast(`截图失败：${reason}。可能是元素已从页面移除或渲染内容无法导出。请重新框选，或换一个区域再试。`)
+    }
+
+    deps.addMark(mark)
+  }
+
   /* ---------- badges + cross-origin notices ---------- */
 
   /**
@@ -415,7 +630,16 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     return 1
   }
 
-  function resolveMarkElement(mark: Mark): { el: Element; frameRect: DOMRect | null; scale: number } | null {
+  function parseRegionSelector(selector: string): { x: number; y: number; width: number; height: number } | null {
+    const m = /^region:(-?\d+),(-?\d+),(\d+),(\d+)$/.exec(selector)
+    if (!m) return null
+    const [, xs, ys, ws, hs] = m
+    const rect = { x: Number(xs), y: Number(ys), width: Number(ws), height: Number(hs) }
+    if (rect.width <= 0 || rect.height <= 0) return null
+    return rect
+  }
+
+  function resolveMarkElement(mark: Mark): { el: Element | null; rect: { x: number; y: number; width: number; height: number } | null; frameRect: DOMRect | null; scale: number } | null {
     let doc: Document = document
     let frameRect: DOMRect | null = null
     let scale = 1
@@ -434,10 +658,14 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
         return null
       }
     }
+    const regionRect = parseRegionSelector(mark.selector)
+    if (regionRect !== null) {
+      return { el: null, rect: regionRect, frameRect, scale }
+    }
     try {
       const el = doc.querySelector(mark.selector)
       if (el === null) return null
-      return { el, frameRect, scale }
+      return { el, rect: null, frameRect, scale }
     } catch (e) {
       // A selector can become invalid only if it was built against a vanished
       // document; treat as "element gone" and hide the badge.
@@ -446,15 +674,44 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     }
   }
 
-  function elementParentRect(mark: Mark, el: Element, frameRect: DOMRect | null, scale: number): { left: number; top: number } {
-    const r = el.getBoundingClientRect()
-    if (mark.frameKind === 'iframe' && frameRect !== null) {
-      // Parent-viewport coords = iframe rect (already parent-relative, including
-      // any fit-width transform) + the element's iframe-viewport rect scaled by
-      // the same factor.
-      return { left: frameRect.left + r.left * scale, top: frameRect.top + r.top * scale }
+  function markViewportRect(
+    mark: Mark,
+    resolved: { el: Element | null; rect: { x: number; y: number; width: number; height: number } | null; frameRect: DOMRect | null; scale: number },
+  ): { left: number; top: number; width: number; height: number } {
+    if (resolved.el !== null) {
+      const r = resolved.el.getBoundingClientRect()
+      if (mark.frameKind === 'iframe' && resolved.frameRect !== null) {
+        // Parent-viewport coords = iframe rect (already parent-relative, including
+        // any fit-width transform) + the element's iframe-viewport rect scaled by
+        // the same factor.
+        return {
+          left: resolved.frameRect.left + r.left * resolved.scale,
+          top: resolved.frameRect.top + r.top * resolved.scale,
+          width: r.width * resolved.scale,
+          height: r.height * resolved.scale,
+        }
+      }
+      return { left: r.left, top: r.top, width: r.width, height: r.height }
     }
-    return { left: r.left, top: r.top }
+    if (resolved.rect !== null) {
+      const r = resolved.rect
+      const win = document.defaultView
+      const scrollX = win?.scrollX ?? 0
+      const scrollY = win?.scrollY ?? 0
+      if (mark.frameKind === 'iframe' && resolved.frameRect !== null) {
+        // Region coords are document coords inside the iframe; convert to
+        // parent viewport coords by subtracting iframe scroll and scaling.
+        return {
+          left: resolved.frameRect.left + (r.x - scrollX) * resolved.scale,
+          top: resolved.frameRect.top + (r.y - scrollY) * resolved.scale,
+          width: r.width * resolved.scale,
+          height: r.height * resolved.scale,
+        }
+      }
+      // Main/office region: document coords → viewport coords.
+      return { left: r.x - scrollX, top: r.y - scrollY, width: r.width, height: r.height }
+    }
+    return { left: 0, top: 0, width: 0, height: 0 }
   }
 
   function ensureOverlay(): HTMLDivElement {
@@ -480,7 +737,7 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
   function renderBadges(): void {
     const layer = ensureOverlay()
     const wanted = new Set(state.marks.map(m => m.index))
-    // Remove badges (and their kept outline) whose mark is gone.
+    // Remove badges (and their kept outline / region border) whose mark is gone.
     for (const badge of Array.from(layer.children)) {
       const index = Number((badge as HTMLElement).dataset.index)
       if (!wanted.has(index)) {
@@ -490,11 +747,16 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
           kept.style.outline = ''
           keptEls.delete(index)
         }
+        const regionBorder = regionEls.get(index)
+        if (regionBorder) {
+          regionBorder.remove()
+          regionEls.delete(index)
+        }
         badge.remove()
       }
     }
     // Ensure a badge exists for every current mark, and keep the element
-    // highlighted. Position is set in repositionAll().
+    // highlighted / region bordered. Position is set in repositionAll().
     for (const mark of state.marks) {
       let badge = layer.querySelector<HTMLElement>(`.dsh-point-badge[data-index="${mark.index}"]`)
       if (badge === null) {
@@ -512,11 +774,35 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
       badge.classList.toggle('pending', mark.status === 'pending')
       badge.title = mark.status === 'sent' ? '已发送：点击打开查看' : '点击打开评论'
       const resolved = resolveMarkElement(mark)
-      if (resolved !== null && resolved.el.isConnected && resolved.el instanceof HTMLElement) {
+      if (resolved === null) continue
+      if (resolved.el !== null && resolved.el.isConnected && resolved.el instanceof HTMLElement) {
         resolved.el.style.outline = KEPT_OUTLINE
         resolved.el.style.outlineOffset = '1px'
         ;(resolved.el as unknown as Record<string, unknown>)[KEPT_FLAG] = true
         keptEls.set(mark.index, resolved.el)
+      } else if (resolved.rect !== null) {
+        // Region mark: keep a persistent border in the marked document so it
+        // scrolls with the content and is visually anchored to the selection.
+        let border = regionEls.get(mark.index)
+        const ownerDoc = resolved.frameRect !== null ? (() => {
+          try {
+            const frame = Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe[data-testid="web-preview-frame"]'))
+              .find(f => (f.title || f.getAttribute('title') || '') === mark.frameTitle)
+            return frame?.contentDocument ?? document
+          } catch { return document }
+        })() : document
+        if (border === undefined || border.ownerDocument !== ownerDoc) {
+          border?.remove()
+          border = ownerDoc.createElement('div')
+          border.className = REGION_KEPT_CLASS
+          border.dataset.index = String(mark.index)
+          ownerDoc.body.appendChild(border)
+          regionEls.set(mark.index, border)
+        }
+        border.style.left = `${resolved.rect.x}px`
+        border.style.top = `${resolved.rect.y}px`
+        border.style.width = `${resolved.rect.width}px`
+        border.style.height = `${resolved.rect.height}px`
       }
     }
     repositionBadges()
@@ -528,13 +814,18 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
       const badge = overlay.querySelector<HTMLElement>(`.dsh-point-badge[data-index="${mark.index}"]`)
       if (badge === null) continue
       const resolved = resolveMarkElement(mark)
-      if (resolved === null || !resolved.el.isConnected) {
+      if (resolved === null) {
+        badge.style.display = 'none'
+        continue
+      }
+      const visible = resolved.el !== null ? resolved.el.isConnected : true
+      if (!visible) {
         // Element disappeared (preview switch / remount): hide the badge but
         // keep the mark in the store (holes preserved, numbering unchanged).
         badge.style.display = 'none'
         continue
       }
-      const { left, top } = elementParentRect(mark, resolved.el, resolved.frameRect, resolved.scale)
+      const { left, top } = markViewportRect(mark, resolved)
       badge.style.display = ''
       badge.style.left = `${left}px`
       badge.style.top = `${top}px`
@@ -681,22 +972,19 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     const mark = state.marks.find(m => m.index === state.activeIndex)
     if (mark === undefined) return
     const resolved = resolveMarkElement(mark)
-    if (resolved === null || !resolved.el.isConnected) {
+    if (resolved === null) {
+      container.style.display = 'none'
+      return
+    }
+    const visible = resolved.el !== null ? resolved.el.isConnected : true
+    if (!visible) {
       container.style.display = 'none'
       return
     }
     container.style.display = ''
-    const r = resolved.el.getBoundingClientRect()
-    const rect = resolved.frameRect !== null
-      ? new DOMRect(
-        resolved.frameRect.left + r.left * resolved.scale,
-        resolved.frameRect.top + r.top * resolved.scale,
-        r.width * resolved.scale,
-        r.height * resolved.scale,
-      )
-      : r
+    const rect = markViewportRect(mark, resolved)
     const pad = 8
-    let top = rect.bottom + pad
+    let top = rect.top + rect.height + pad
     let left = rect.left
     const vw = window.innerWidth
     const vh = window.innerHeight
@@ -770,10 +1058,29 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     showHint('只能标记预览面板里的内容')
   }
 
+  function onDocMouseDown(e: MouseEvent): void {
+    if (!state.marking) return
+    startDrag(e, document)
+  }
+
+  function onDocMouseMove(e: MouseEvent): void {
+    if (!state.marking) return
+    updateDrag(e)
+  }
+
+  function onDocMouseUp(e: MouseEvent): void {
+    if (!state.marking) return
+    endDrag(e)
+  }
+
   function onKeyDown(e: KeyboardEvent): void {
-    if (e.key === 'Escape' && state.marking) {
-      deps.setMarking(false)
+    if (e.repeat || e.key !== 'Escape' || !state.marking) return
+    if (dragState !== null) {
+      dragState = null
+      removeDragRect()
+      return
     }
+    deps.setMarking(false)
   }
 
   /* ---------- lifecycle ---------- */
@@ -784,6 +1091,11 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     document.addEventListener('click', onDocClick, true)
     document.addEventListener('keydown', onKeyDown, true)
     document.addEventListener('scroll', onScrollOrResize, true)
+    // 2026-08-24: main-document drag handles main-page and office-container
+    // region selection; iframe drag listeners are attached per iframe document.
+    document.addEventListener('mousedown', onDocMouseDown, true)
+    document.addEventListener('mousemove', onDocMouseMove, true)
+    document.addEventListener('mouseup', onDocMouseUp, true)
     window.addEventListener('scroll', onScrollOrResize, true)
     window.addEventListener('resize', onScrollOrResize)
     const vv = window.visualViewport
@@ -827,10 +1139,15 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
   function dispose(): void {
     disposed = true
     clearHover()
+    dragState = null
+    removeDragRect()
     delete (window as unknown as Record<string, unknown>).__dshPoint
     document.removeEventListener('click', onDocClick, true)
     document.removeEventListener('keydown', onKeyDown, true)
     document.removeEventListener('scroll', onScrollOrResize, true)
+    document.removeEventListener('mousedown', onDocMouseDown, true)
+    document.removeEventListener('mousemove', onDocMouseMove, true)
+    document.removeEventListener('mouseup', onDocMouseUp, true)
     window.removeEventListener('scroll', onScrollOrResize, true)
     window.removeEventListener('resize', onScrollOrResize)
     const vv = window.visualViewport
@@ -846,6 +1163,8 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
       el.style.outline = ''
     }
     keptEls.clear()
+    for (const border of regionEls.values()) border.remove()
+    regionEls.clear()
     if (overlay !== null) { overlay.remove(); overlay = null }
     if (crossLayer !== null) { crossLayer.remove(); crossLayer = null }
     if (popupLayer !== null) { popupLayer.remove(); popupLayer = null }
@@ -1010,6 +1329,20 @@ body.dsh-point-marking .dsh-point-cross { cursor: pointer; }
 .dsh-point-badge.pending { background: #d97706; }
 .dsh-point-badge.sent { background: #6b7280; }
 .dsh-point-badge.sent::after { content: '✓'; margin-left: 2px; }
+.dsh-point-region-rect {
+  position: absolute;
+  border: 2px dashed #2563eb;
+  background: rgba(37, 99, 235, 0.08);
+  pointer-events: none;
+  z-index: 2147483000;
+}
+.dsh-point-region-kept {
+  position: absolute;
+  border: 2px dashed #2563eb;
+  background: rgba(37, 99, 235, 0.04);
+  pointer-events: none;
+  z-index: 2147482999;
+}
 `
   document.head.appendChild(style)
 }
