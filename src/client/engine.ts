@@ -69,6 +69,10 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
   const attachedOffices = new Set<HTMLElement>()
   const officeListeners = new WeakMap<HTMLElement, { over: EventListener; out: EventListener; click: EventListener }>()
   let lastHintAt = 0
+  // 2026-08-24: re-entrancy guard — rapid double-clicks would otherwise run two
+  // captures concurrently against the same state.nextIndex, producing duplicate
+  // marks sharing one index.
+  let captureInFlight = false
 
   ensureStyle()
 
@@ -127,6 +131,25 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
 
   /* ---------- frame listeners ---------- */
 
+  /**
+   * Walk up from `el` to an ancestor carrying KEPT_FLAG and return that mark's
+   * index. Clicking an already-marked element reopens its comment popup instead
+   * of capturing a duplicate mark (aligned with the extension's findMarkedAncestor).
+   */
+  function findKeptMarkIndex(el: Element): number | null {
+    let cur: Element | null = el
+    while (cur !== null) {
+      if ((cur as unknown as Record<string, unknown>)[KEPT_FLAG]) {
+        for (const [idx, kept] of keptEls) {
+          if (kept === cur) return idx
+        }
+        return null
+      }
+      cur = cur.parentElement
+    }
+    return null
+  }
+
   function attachDocListeners(doc: Document, frame: HTMLIFrameElement): void {
     doc.addEventListener('mouseover', (e: MouseEvent) => {
       if (!state.marking) return
@@ -150,6 +173,8 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
       const el = raw
       if (el.nodeType !== 1) return
       if (el.closest('.dsh-point-badge, .dsh-point-toast, .dsh-point-cross')) return
+      const keptIndex = findKeptMarkIndex(el)
+      if (keptIndex !== null) { deps.openMark(keptIndex); return }
       void captureElement(el, frame)
     }, true)
     // Iframe-internal scroll must reposition the parent-page badges.
@@ -188,7 +213,16 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
 
   function onFrameLoad(e: Event): void {
     const frame = e.target as HTMLIFrameElement | null
-    if (frame) tryAttachContent(frame)
+    if (!frame) return
+    // 2026-08-24: a load event means the iframe navigated (or refreshed). Any
+    // listeners bound to the previous document are stranded on a dead document,
+    // and a stale cross-origin verdict may no longer hold. Reset the flags so
+    // tryAttachContent binds the fresh document.
+    frame.__dshPointAttached = false
+    frame.__dshPointCrossOrigin = false
+    crossFrames.delete(frame)
+    tryAttachContent(frame)
+    renderCrossNotices()
   }
 
   function syncFrames(): void {
@@ -238,6 +272,8 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     const el = e.target as Element
     if (!el || el.nodeType !== 1) return
     if ((el as Element).closest('.dsh-point-badge, .dsh-point-toast, .dsh-point-cross')) return
+    const keptIndex = findKeptMarkIndex(el)
+    if (keptIndex !== null) { deps.openMark(keptIndex); return }
     void captureElement(el, undefined)
   }
 
@@ -276,6 +312,16 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
   /* ---------- capture ---------- */
 
   async function captureElement(el: Element, frame: HTMLIFrameElement | undefined): Promise<void> {
+    if (captureInFlight) return
+    captureInFlight = true
+    try {
+      await captureElementInner(el, frame)
+    } finally {
+      captureInFlight = false
+    }
+  }
+
+  async function captureElementInner(el: Element, frame: HTMLIFrameElement | undefined): Promise<void> {
     let frameKind: 'iframe' | 'office' | 'main' = 'main'
     let source = '页面'
     let frameTitle: string | undefined

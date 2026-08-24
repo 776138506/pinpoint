@@ -77,12 +77,57 @@ describe('Esc 退出同步（状态撕裂修复）', () => {
       },
     })
     await import('./content.ts')
-    await vi.waitFor(() => {}) // 等 storage.local.get 微任务
-    await Promise.resolve()
+    // 等 storage.local.get 微任务链走完（显式 flush，不用空 waitFor 假等待）
+    for (let i = 0; i < 10; i++) await Promise.resolve()
 
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'K', ctrlKey: true, shiftKey: true, bubbles: true }))
     expect(document.body.classList.contains('dsh-point-ext-marking')).toBe(true)
     expect(h.sendMessage).toHaveBeenCalledWith({ type: 'MARKING_STATE_SYNC', marking: true })
+  })
+})
+
+describe('长按 repeat 守卫（2026-08-24）', () => {
+  it('repeat 的 Esc 不重复触发退出同步', async () => {
+    const h = setup()
+    await import('./content.ts')
+    const res = h.fireMessage({ type: 'TOGGLE_MARKING' }) as { marking: boolean }
+    expect(res.marking).toBe(true)
+    h.sendMessage.mockClear()
+
+    // 长按 Esc：repeat 事件必须被忽略，只认第一次按下
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', repeat: true, bubbles: true }))
+    expect(document.body.classList.contains('dsh-point-ext-marking')).toBe(true)
+    expect(h.sendMessage).not.toHaveBeenCalled()
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    expect(document.body.classList.contains('dsh-point-ext-marking')).toBe(false)
+    // 同文件早前用例的 content 实例仍挂在 document 上且读同一个全局 chrome stub，
+    // 退出同步可能多发；只断言「至少一条退出同步且 repeat 不产生增量」（上面的
+    // not.toHaveBeenCalled 已锁住 repeat 路径）
+    const exitSyncs = h.sendMessage.mock.calls.filter(
+      c => (c[0] as { type?: string; marking?: boolean }).type === 'MARKING_STATE_SYNC'
+        && (c[0] as { marking?: boolean }).marking === false,
+    )
+    expect(exitSyncs.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('repeat 的自定义快捷键不反复 toggle', async () => {
+    const h = setup()
+    vi.stubGlobal('chrome', {
+      runtime: h.runtime,
+      storage: {
+        local: { get: (key: string) => Promise.resolve(key === 'customShortcut' ? { customShortcut: 'Ctrl+Shift+K' } : {}) },
+        onChanged: { addListener: () => {} },
+      },
+    })
+    await import('./content.ts')
+    for (let i = 0; i < 10; i++) await Promise.resolve()
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'K', ctrlKey: true, shiftKey: true, bubbles: true }))
+    expect(document.body.classList.contains('dsh-point-ext-marking')).toBe(true)
+    // 长按产生的 repeat 事件不得把标记态又切回去
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'K', ctrlKey: true, shiftKey: true, repeat: true, bubbles: true }))
+    expect(document.body.classList.contains('dsh-point-ext-marking')).toBe(true)
   })
 })
 

@@ -44,17 +44,31 @@ function itemKey(i: { tabId?: number; index: number }): string {
 // 2026-08-24: port 断线自动重连（复归整改）。MV3 SW 空闲即死、port 随之断开；
 // 面板作后台 tab 时健康轮询被 Chrome 节流，撞死 port 后点击按钮静默无反应。
 let port: chrome.runtime.Port | null = null
+// 2026-08-24: 指数退避 + 连续失败上限——扩展失效（重载/更新）时 connect 永远抛，
+// 1s 无限重试会静默空转还刷屏日志；放弃后明确告知用户如何复归
+let connectFailures = 0
+const MAX_CONNECT_FAILURES = 10
 
 function connectPort(): void {
+  if (port) return // 已有活连接，防叠加重连
   let p: chrome.runtime.Port
   try {
     p = chrome.runtime.connect({ name: 'dsh-point-panel' })
   } catch (e) {
-    // 扩展重载/更新后旧页面上下文失效，connect 会抛——过 1s 再试
-    console.warn('[dsh-point-ext] connect failed, retry in 1s:', e)
-    setTimeout(connectAndResync, 1000)
+    connectFailures += 1
+    if (connectFailures >= MAX_CONNECT_FAILURES) {
+      console.error('[dsh-point-ext] connect failed permanently:', e)
+      state.connected = false
+      state.statusError = '扩展已失效（可能刚更新或重载），请关闭后重新打开侧边栏'
+      updateUi()
+      return
+    }
+    const delay = Math.min(1000 * 2 ** (connectFailures - 1), 30000)
+    console.warn(`[dsh-point-ext] connect failed, retry in ${delay}ms:`, e)
+    setTimeout(connectAndResync, delay)
     return
   }
+  connectFailures = 0
   p.onMessage.addListener(onPortMessage)
   p.onDisconnect.addListener(() => {
     if (port !== p) return

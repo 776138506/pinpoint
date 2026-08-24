@@ -59,11 +59,17 @@ async function rpc<T>(method: string, payload: unknown): Promise<RpcResult<T>> {
       const text = (await res.text().catch(() => '')).slice(0, 120)
       return { ok: false, error: { code: 'transport', message: `HTTP ${res.status}: ${text}`, details: {} } }
     }
-    const full = await res.json() as { type: 'server-response'; rpcId: string; result: RpcResult<T> }
+    const full = await res.json() as { type?: string; rpcId?: string; result?: RpcResult<T> }
     if (full.rpcId !== rpcId) {
       return { ok: false, error: { code: 'transport', message: `rpcId mismatch for ${method}`, details: {} } }
     }
-    return full.result
+    // 2026-08-24: 非 dsh 服务/代理可能回 200 + 非信封 JSON——校验信封形状，
+    // 否则 result 为 undefined 时调用方访问 result.ok 直接抛 TypeError
+    const r = full.result as { ok?: unknown } | undefined
+    if (full.type !== 'server-response' || !r || typeof r !== 'object' || typeof r.ok !== 'boolean') {
+      return { ok: false, error: { code: 'transport', message: `malformed response envelope for ${method}`, details: {} } }
+    }
+    return full.result as RpcResult<T>
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
       return { ok: false, error: { code: 'transport', message: `rpc ${method} timed out after ${settings.rpcTimeoutMs}ms`, details: {} } }
@@ -165,13 +171,15 @@ function contentParts(mark: Mark, comment: string): { type: string; text?: strin
 async function sendPrompt(sessionId: string, mark: Mark, comment: string): Promise<{ ok: boolean; error?: string; downgraded?: boolean }> {
   const parts = contentParts(mark, comment)
   const imagePart = parts.find(p => p.type === 'image')
+  // 2026-08-24: 有截图但 base64 提取失败时图片会被静默丢弃——计为降级并告知调用方
+  const imageDropped = Boolean(mark.screenshot) && !imagePart
   const result = await rpc('session.prompt', {
     sessionId,
     mode: 'queue',
     content: parts,
     clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
   })
-  if (result.ok) return { ok: true }
+  if (result.ok) return { ok: true, downgraded: imageDropped || undefined }
   if (imagePart && result.error.code === 'attachment-error') {
     // Downgrade to text-only and surface the downgrade explicitly.
     const textResult = await rpc('session.prompt', {
@@ -282,12 +290,15 @@ chrome.runtime.onConnect.addListener((port) => {
             postToPanel({ type: 'SESSIONS_ERROR', error: 'malformed session.list payload' })
             break
           }
-          const sessions = (value.items as SessionItem[]).map(item => ({
-            sessionId: item.sessionId,
-            updatedAt: item.updatedAt,
-            blank: item.blank,
-            title: item.projections?.values?.title ?? null,
-          }))
+          const sessions = (value.items as SessionItem[])
+            // 2026-08-24: 逐项过滤无 sessionId 的脏条目，避免侧栏渲染出不可选会话
+            .filter(item => item && typeof item.sessionId === 'string')
+            .map(item => ({
+              sessionId: item.sessionId,
+              updatedAt: item.updatedAt,
+              blank: item.blank,
+              title: item.projections?.values?.title ?? null,
+            }))
           postToPanel({ type: 'SESSIONS', sessions })
           break
         }
@@ -307,7 +318,7 @@ chrome.runtime.onConnect.addListener((port) => {
         }
         case 'SEND_MARK': {
           const m = message as Partial<{ sessionId: string; mark: Mark; comment: string; tabId: number }>
-          if (typeof m.sessionId !== 'string' || !m.mark || typeof m.comment !== 'string') {
+          if (typeof m.sessionId !== 'string' || !m.mark || typeof m.mark.index !== 'number' || typeof m.comment !== 'string') {
             postToPanel({ type: 'SEND_RESULT', markIndex: -1, ok: false, error: 'malformed SEND_MARK' })
             break
           }
@@ -333,7 +344,13 @@ chrome.runtime.onConnect.addListener((port) => {
             }
           } else {
             setTabMarking(tab.id, outcome.marking)
-            postToPanel({ type: 'MARKING_STATE', marking: outcome.marking })
+            // 2026-08-24: toggle 是异步的，期间用户可能已切 tab——回推「当前
+            // 活动 tab」的标记态而非被操作 tab 的，避免按钮显示错 tab 的状态
+            const [now] = await chrome.tabs.query({ active: true, currentWindow: true })
+            postToPanel({
+              type: 'MARKING_STATE',
+              marking: now?.id !== undefined ? markingTabs.has(now.id) : outcome.marking,
+            })
           }
           break
         }
@@ -369,8 +386,16 @@ const STAGED_KEY = 'stagedQueue'
 // 会用尚未恢复的空队列覆盖 storage 里已持久化的暂存（数据丢失，本次实测踩中）
 const queueReady: Promise<void> = chrome.storage.session.get(STAGED_KEY).then((data) => {
   const saved = data[STAGED_KEY]
-  if (Array.isArray(saved) && stagedQueue.length === 0) {
-    stagedQueue.push(...saved as typeof stagedQueue)
+  if (!Array.isArray(saved)) return
+  // 2026-08-24: 合并而非「空才恢复」——旧逻辑要求内存队列为空才恢复，SW 重启后
+  // 恢复完成前到达的新 STAGE_MARK 会让已持久化的暂存被整体丢弃（数据丢失）。
+  // 按 (tabId, index) 复合键去重：内存里已有的以新到的为准。
+  for (const item of saved as typeof stagedQueue) {
+    if (!item || typeof item !== 'object') continue
+    const m = item.mark as Mark | undefined
+    if (!m || typeof m.index !== 'number') continue
+    const dup = stagedQueue.some(q => q.mark.index === m.index && q.tabId === item.tabId)
+    if (!dup) stagedQueue.push(item)
   }
 }).catch((e) => console.error('[dsh-point-ext] restore staged queue failed:', e))
 
@@ -390,7 +415,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     const tabId = sender.tab?.id
     if (!panelPort) {
-      stagedQueue.push({ mark, sendNow: message.sendNow, tabId })
+      // 2026-08-24: 缓冲去重——同一 (tabId, index) 重复暂存时以新到的为准，
+      // 避免侧栏重连后冲刷出重复项
+      const existing = stagedQueue.findIndex(q => q.mark.index === mark.index && q.tabId === tabId)
+      if (existing >= 0) stagedQueue[existing] = { mark, sendNow: message.sendNow, tabId }
+      else stagedQueue.push({ mark, sendNow: message.sendNow, tabId })
       persistQueue()
       sendResponse({ ok: true, buffered: true })
       return false
@@ -430,7 +459,12 @@ chrome.commands.onCommand.addListener(async (command) => {
       }
     } else {
       setTabMarking(tab.id, outcome.marking)
-      postToPanel({ type: 'MARKING_STATE', marking: outcome.marking })
+      // 2026-08-24: 与侧栏路径一致——回推当前活动 tab 的标记态（toggle 期间可能已切 tab）
+      const [now] = await chrome.tabs.query({ active: true, currentWindow: true })
+      postToPanel({
+        type: 'MARKING_STATE',
+        marking: now?.id !== undefined ? markingTabs.has(now.id) : outcome.marking,
+      })
     }
   } catch (e) {
     console.error('[dsh-point-ext] command handler failed:', e)

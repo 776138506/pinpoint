@@ -140,3 +140,58 @@ describe('port 断线自动重连', () => {
     expect(posted).toContain('LIST_SESSIONS')
   }, 10000)
 })
+
+describe('connect 持续失败（扩展失效）的退避与放弃（2026-08-24）', () => {
+  it('指数退避重试，连续失败 10 次后放弃并提示重开侧边栏', async () => {
+    vi.useFakeTimers()
+    try {
+      const h = setup()
+      h.connect.mockImplementation(() => { throw new Error('Extension context invalidated') })
+      await import('./sidepanel.ts')
+      // 退避序列 1s,2s,4s,8s,16s,30s×4 ≈ 121s，一次推完
+      await vi.advanceTimersByTimeAsync(200000)
+      expect(h.connect).toHaveBeenCalledTimes(10)
+      const status = document.getElementById('status')?.textContent ?? ''
+      expect(status).toContain('扩展已失效')
+      // 放弃后不再重试
+      await vi.advanceTimersByTimeAsync(120000)
+      expect(h.connect).toHaveBeenCalledTimes(10)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('首次 connect 失败后恢复：退避重试成功即正常工作', async () => {
+    vi.useFakeTimers()
+    try {
+      const h = setup()
+      let fail = true
+      h.connect.mockImplementation(() => {
+        if (fail) throw new Error('Extension context invalidated')
+        // 恢复后走正常 stub（mockImplementation 需返回 port 形态——复用原实现不可行，手工还原）
+        const messageListeners: Listener[] = []
+        const disconnectListeners: Listener[] = []
+        const stub: PortStub = {
+          postMessage: vi.fn(),
+          fireMessage: (msg) => { for (const fn of messageListeners) fn(msg as never) },
+          fireDisconnect: () => { for (const fn of disconnectListeners) fn() },
+        }
+        h.ports.push(stub)
+        return {
+          postMessage: stub.postMessage,
+          onMessage: { addListener: (fn: Listener) => messageListeners.push(fn) },
+          onDisconnect: { addListener: (fn: Listener) => disconnectListeners.push(fn) },
+        }
+      })
+      await import('./sidepanel.ts')
+      expect(h.connect).toHaveBeenCalledTimes(1)
+      fail = false
+      await vi.advanceTimersByTimeAsync(1100) // 第一次退避 1s
+      expect(h.connect).toHaveBeenCalledTimes(2)
+      const posted = h.ports.at(-1)!.postMessage.mock.calls.map(c => (c[0] as { type?: string }).type)
+      expect(posted).toContain('HEALTH_CHECK')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

@@ -122,10 +122,13 @@ export function apply(ctx: Ctx): void {
           const { actx, conversation } = scopeChecked(ctx, sessionId)
           const input = conversation.input.for(actx)
           const ids = imageIdsFromMark(conversation, mark)
-          if (ids.length > 0 && !input.addImages(ids)) {
-            throw new Error('当前输入框正在处理其他操作（如发送中），请稍后再插入。')
-          }
+          // 2026-08-24: write the text first, then the images. The old order
+          // (images → setDraft) left dangling images in the composer when
+          // setDraft threw after addImages had already succeeded.
           input.setDraft(formatMarkText(mark, comment))
+          if (ids.length > 0 && !input.addImages(ids)) {
+            throw new Error('文字已写入输入框，但截图插入失败（输入框正忙）。请稍后重试「回输入框」以补上截图。')
+          }
         },
       }),
     }, PointDock)

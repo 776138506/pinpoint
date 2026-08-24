@@ -112,9 +112,12 @@ export function createMarkingStore(): MarkingStoreHandle {
       const actions: MarkingActions = {
         setMarking: (on) => { setState({ ...state, marking: on }) },
         addMark: (mark) => {
+          // 2026-08-24: defensive dedup — a re-entrant capture path must not
+          // leave two marks sharing one index; replace any stale entry.
+          const marks = state.marks.filter(m => m.index !== mark.index)
           setState({
             ...state,
-            marks: [...state.marks, { ...mark, status: mark.status ?? 'draft' }],
+            marks: [...marks, { ...mark, status: mark.status ?? 'draft' }],
             nextIndex: Math.max(state.nextIndex, mark.index + 1),
             activeIndex: mark.index,
           })

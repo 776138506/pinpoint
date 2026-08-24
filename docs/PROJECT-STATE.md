@@ -205,3 +205,21 @@
 - 测试：新增 content.spec.ts（jsdom，Esc 同步/快捷键同步/失效守卫 3 条）、sidepanel.spec.ts（jsdom，sending 降级/断线重连 2 条）、background.spec.ts 补 2 条（重连探态/探测失败不回推）；77/77 绿（含 tsc）+ build 绿
 - 枚举后判定为「已有覆盖」的边界（抽查确认）：捕获时了结旧草稿/退出标记了结草稿/关闭草稿窗即撤销（高亮⇔暂存不变量）、截图超时降级纯文本、发送看门狗、点已标记元素重开评论、捕获防抖 captureInFlight、popupBusy 防双击、暂存区跨 tab 删除/清空、FOCUS_MARK 页面已导航如实报错、SPA 导航标记保留+角标隐藏
 - 已知不改项：截图异步期间退出标记仍会弹评论窗（与「角标点击开评论」同语义，非缺陷）；跨域 iframe 内元素不可标记（manifest 未开 all_frames，边界有意）；旧实例内联 outline 无法枚举清理（随刷新消失）
+
+### 2026-08-24 ｜ 全面审查二轮：并发/竞态/注入面 13 处缺口修复
+- 缺口与修复（审查：三路并行源码审查 + 逐条人工核实，全部为真实可触发路径）：
+  - P0 engine：捕获无防重入且无 KEPT_FLAG 检查——连点/点已标记元素会并发跑 captureElement 读同一 nextIndex，产生同 index 重复 mark。加 captureInFlight 闸 + findKeptMarkIndex 重开 popup（对齐扩展侧 findMarkedAncestor 语义）；stores.addMark 同 index 替换而非追加作最后防线
+  - P1 engine：iframe 内导航/刷新后 `__dshPointAttached` 永不重置 → 监听器 stranded 在死文档上，标记功能静默失效。onFrameLoad 重置 attached/crossOrigin 标志并重绑
+  - P1 PointDock：单条发送 busyOne 时批量按钮仍可点（并发双发）；任一发送在飞时其他行单发/回输入框仍可点。统一 `busyAll || busyOne !== null` 门禁
+  - P1 index：editInComposer 先 addImages 后 setDraft——setDraft 抛异常时输入框留悬空图片。换序为先文本后图片，图片失败时报错文案明示「文字已写入」
+  - P1 referent-card：消息内容里的 source.url 直接进 `link.href`（javascript:/data: 可注入）。URL 协议白名单 http/https，其余渲染纯文本
+  - P1 background：queueReady 恢复「空才恢复」——SW 重启后恢复完成前到达的新 STAGE_MARK 让已持久化暂存被整体丢弃（数据丢失）。改为按 (tabId, index) 合并去重
+  - P1 background：toggle 完成后直接回推被操作 tab 状态——期间用户切 tab 则按钮显示错 tab 状态。改为重查当前活动 tab 回推
+  - P1 background：rpc 只校验 rpcId——200 + 非信封 JSON 时调用方访问 result.ok 抛 TypeError。补 server-response/result.ok 形状校验
+  - P1 sidepanel：connect 失败 1s 无限重试（扩展失效时静默空转）。指数退避（1s→30s 封顶）+ 连续 10 次放弃并提示「关闭后重新打开侧边栏」；connectPort 入口互斥防叠加
+  - P1 options：「全部恢复默认」未清 customShortcut，文案不名副其实。同步清除
+  - P2 background：STAGE_MARK 缓冲不去重（重连冲刷出重复项）→ 同键替换；SEND_MARK 补 mark.index 校验；session.list 逐项过滤脏条目；截图 base64 提取失败从静默丢失改为 downgraded 上报
+  - P2 键盘：content onKeyDown 与 options 快捷键录入补 e.repeat 守卫（长按反复 toggle）；options 录入放行 F1-F12 与 Ctrl/⌘+R/T/W/N/Q/L 等浏览器自身按键
+- 测试：新增 stores.spec.ts（2 条）；background.spec.ts harness 升级（tabsQuery/sessionGet/sessionSet 可编程）+ 7 条新用例（恢复合并/去重×2/切 tab 回推/信封校验/脏条目过滤/malformed 不发起 rpc）；content.spec.ts 修假等待 + repeat 守卫 2 条；sidepanel.spec.ts 补 connect 退避放弃/退避后恢复 2 条（fake timers）。90/90 绿（含 tsc）+ build 绿
+- 记录为已知不改项：saveSettings 双选项页 read-modify-write 竞态（storage 无原子合并）；attachment-error 降级重发文字重复风险（待验证 dsh 幂等性）；persistQueue 超 10MB 配额只记日志（ponytail 已注）；referent-card MutationObserver dispose 未接（enhancer 幂等）；manifest host_permissions 过宽（任意页标记是核心功能，有意）；engine 本地 state 与 store 瞬态撕裂；发送中关 popup 失重试入口；批量发送用渲染快照；textFragmentFor 死代码路径；engine 未填 anchor 字段（dsh 侧精准定位未启用）
+- 教训：jsdom 同文件多用例共享 document——早前用例挂的 content 实例监听器不清，且读「当前」全局 chrome stub，会串到后跑用例的 mock（断言计数需容忍或用行为断言）

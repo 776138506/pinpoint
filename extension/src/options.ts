@@ -51,9 +51,11 @@ reqEl<HTMLButtonElement>('settings-save').addEventListener('click', async () => 
 })
 
 reqEl<HTMLButtonElement>('settings-reset').addEventListener('click', async () => {
-  await chrome.storage.local.remove('settings')
+  // 2026-08-24: 「全部恢复默认」要名副其实——自定义快捷键也一并清掉
+  await chrome.storage.local.remove(['settings', 'customShortcut'])
   fillSettingsInputs({ ...DEFAULT_SETTINGS })
-  showHint('已恢复默认', 'ok')
+  shortcutInput.value = BUILTIN_SHORTCUT
+  showHint('已恢复默认（含快捷键）', 'ok')
 })
 
 /* ---------- 标记快捷键：按键即绑定 ---------- */
@@ -79,6 +81,11 @@ async function loadShortcut(): Promise<void> {
 shortcutInput.addEventListener('keydown', async (e) => {
   // Tab 留给焦点导航，Esc 取消录入
   if (e.key === 'Tab') return
+  // 2026-08-24: 放行浏览器自身按键（刷新/新标签/关窗/功能键），不把用户
+  // 习惯操作吞进录入框；长按重复触发也只认第一次
+  if (e.repeat) return
+  if (/^F\d{1,2}$/.test(e.key)) return
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && ['r', 't', 'w', 'n', 'q', 'l'].includes(e.key.toLowerCase())) return
   e.preventDefault()
   if (e.key === 'Escape') {
     shortcutInput.blur()

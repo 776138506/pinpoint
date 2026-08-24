@@ -19,6 +19,9 @@ interface Harness {
   fireTabUpdated: (tabId: number, changeInfo: { status?: string; url?: string }) => void
   sendMessage: ReturnType<typeof vi.fn>
   executeScript: ReturnType<typeof vi.fn>
+  tabsQuery: ReturnType<typeof vi.fn>
+  sessionGet: ReturnType<typeof vi.fn>
+  sessionSet: ReturnType<typeof vi.fn>
 }
 
 function setup(): Harness {
@@ -29,6 +32,9 @@ function setup(): Harness {
   const portMessages: unknown[] = []
   const sendMessage = vi.fn<(tabId: number, msg: unknown) => Promise<unknown>>()
   const executeScript = vi.fn<() => Promise<unknown>>()
+  const tabsQuery = vi.fn<() => Promise<unknown[]>>(() => Promise.resolve([{ id: 7 }])) // 活动 tab = 不支持页
+  const sessionGet = vi.fn<() => Promise<Record<string, unknown>>>(() => Promise.resolve({}))
+  const sessionSet = vi.fn<() => Promise<void>>(() => Promise.resolve())
 
   const chromeStub = {
     sidePanel: { setPanelBehavior: () => Promise.resolve() },
@@ -38,7 +44,7 @@ function setup(): Harness {
     },
     commands: { onCommand: on('command') },
     tabs: {
-      query: () => Promise.resolve([{ id: 7 }]), // 活动 tab = 不支持页
+      query: tabsQuery,
       get: (tabId: number) => Promise.resolve({ id: tabId }),
       update: () => Promise.resolve({}),
       sendMessage,
@@ -50,7 +56,7 @@ function setup(): Harness {
     scripting: { executeScript },
     storage: {
       local: { get: () => Promise.resolve({}) },
-      session: { get: () => Promise.resolve({}), set: () => Promise.resolve() },
+      session: { get: sessionGet, set: sessionSet },
       onChanged: on('storageChanged'),
     },
     action: {
@@ -73,6 +79,9 @@ function setup(): Harness {
     portMessages,
     sendMessage,
     executeScript,
+    tabsQuery,
+    sessionGet,
+    sessionSet,
     fireConnect: () => { for (const fn of listeners.connect ?? []) fn(port as never) },
     firePanelMessage: (msg: unknown) => { for (const fn of listeners.portMessage ?? []) void fn(msg as never) },
     fireContentMessage: (msg: unknown, sender: { tab?: { id: number } }) => {
@@ -213,5 +222,142 @@ describe('侧栏（重）连时探测活动 tab 真实标记态（2026-08-24）'
     await flush()
     const states = h.portMessages.filter((m) => (m as { type?: string }).type === 'MARKING_STATE')
     expect(states).toHaveLength(0)
+  })
+})
+
+/** 构造一个最小合法 Mark（字段齐全即可，值不参与断言的从简） */
+function fakeMark(index: number, text = 't'): Record<string, unknown> {
+  return {
+    index, selector: 'div', text, html: '', source: '页面', frameKind: 'main',
+    screenshot: '', hasExternalImage: false, time: '2026-08-24T00:00:00Z', status: 'pending',
+  }
+}
+
+describe('暂存队列恢复合并与去重（2026-08-24 数据丢失修复）', () => {
+  it('SW 重启恢复完成前到达的新 STAGE_MARK 不再导致已持久化暂存被丢弃', async () => {
+    const h = setup()
+    // 恢复挂起，模拟 SW 重启后 storage 读取尚未完成
+    let resolveGet!: (v: Record<string, unknown>) => void
+    h.sessionGet.mockImplementation(() => new Promise<Record<string, unknown>>((res) => { resolveGet = res }))
+    await import('./background.ts')
+    // 恢复完成前，新标记到达且侧栏未连 → 入内存队列
+    h.fireContentMessage({ type: 'STAGE_MARK', mark: fakeMark(2, 'new') }, { tab: { id: 5 } })
+    resolveGet({ stagedQueue: [{ mark: fakeMark(1, 'persisted'), tabId: 5 }] })
+    await flush()
+    h.fireConnect()
+    await flush()
+    const staged = h.portMessages.filter((m) => (m as { type?: string }).type === 'STAGE_MARK')
+    const indexes = staged.map((m) => (m as { mark: { index: number } }).mark.index).sort()
+    expect(indexes).toEqual([1, 2])
+  })
+
+  it('恢复数据与内存队列按 (tabId, index) 去重，内存中新到的为准', async () => {
+    const h = setup()
+    let resolveGet!: (v: Record<string, unknown>) => void
+    h.sessionGet.mockImplementation(() => new Promise<Record<string, unknown>>((res) => { resolveGet = res }))
+    await import('./background.ts')
+    h.fireContentMessage({ type: 'STAGE_MARK', mark: fakeMark(1, 'newer') }, { tab: { id: 5 } })
+    resolveGet({ stagedQueue: [{ mark: fakeMark(1, 'stale'), tabId: 5 }] })
+    await flush()
+    h.fireConnect()
+    await flush()
+    const staged = h.portMessages.filter((m) => (m as { type?: string }).type === 'STAGE_MARK')
+    expect(staged).toHaveLength(1)
+    expect((staged[0] as { mark: { text: string } }).mark.text).toBe('newer')
+  })
+
+  it('无侧栏时重复暂存同一 (tabId, index)：缓冲只保留最新一条', async () => {
+    const h = setup()
+    await import('./background.ts')
+    h.fireContentMessage({ type: 'STAGE_MARK', mark: fakeMark(1, 'first') }, { tab: { id: 5 } })
+    h.fireContentMessage({ type: 'STAGE_MARK', mark: fakeMark(1, 'second') }, { tab: { id: 5 } })
+    await flush()
+    h.fireConnect()
+    await flush()
+    const staged = h.portMessages.filter((m) => (m as { type?: string }).type === 'STAGE_MARK')
+    expect(staged).toHaveLength(1)
+    expect((staged[0] as { mark: { text: string } }).mark.text).toBe('second')
+  })
+})
+
+describe('toggle 完成后回推当前活动 tab 的标记态（2026-08-24）', () => {
+  it('toggle 异步期间用户切走：侧栏显示新活动 tab 的状态而非被操作 tab 的', async () => {
+    const h = setup()
+    await import('./background.ts')
+    h.fireConnect()
+    await flush()
+    h.portMessages.length = 0
+    h.sendMessage.mockResolvedValue({ marking: true }) // tab 7 toggle 成功进入标记
+    let calls = 0
+    h.tabsQuery.mockImplementation(() => {
+      calls += 1
+      // 第一次（toggle 目标）是 tab 7；完成时的重查返回已切到的 tab 9（未标记）
+      return Promise.resolve([{ id: calls === 1 ? 7 : 9 }])
+    })
+    h.firePanelMessage({ type: 'TOGGLE_MARKING' })
+    await flush()
+    const states = h.portMessages.filter((m) => (m as { type?: string }).type === 'MARKING_STATE')
+    expect(states.at(-1)).toMatchObject({ marking: false })
+  })
+})
+
+describe('rpc 响应信封与输入校验（2026-08-24）', () => {
+  it('200 但缺 result 字段：transport 错误而非调用方 TypeError', async () => {
+    const h = setup()
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => {
+      const { rpcId } = JSON.parse(init.body) as { rpcId: string }
+      return { ok: true, json: async () => ({ type: 'server-response', rpcId }) }
+    }))
+    await import('./background.ts')
+    h.fireConnect()
+    await flush()
+    h.portMessages.length = 0
+    h.firePanelMessage({ type: 'LIST_SESSIONS' })
+    await flush()
+    const errs = h.portMessages.filter((m) => (m as { type?: string }).type === 'SESSIONS_ERROR')
+    expect(errs).toHaveLength(1)
+    expect((errs[0] as { error: string }).error).toContain('malformed response envelope')
+  })
+
+  it('session.list 逐项过滤无 sessionId 的脏条目', async () => {
+    const h = setup()
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => {
+      const { rpcId } = JSON.parse(init.body) as { rpcId: string }
+      return {
+        ok: true,
+        json: async () => ({
+          type: 'server-response',
+          rpcId,
+          result: { ok: true, value: { items: [{ sessionId: 'a', updatedAt: 1 }, { updatedAt: 2 }, null] } },
+        }),
+      }
+    }))
+    await import('./background.ts')
+    h.fireConnect()
+    await flush()
+    h.portMessages.length = 0
+    h.firePanelMessage({ type: 'LIST_SESSIONS' })
+    await flush()
+    const msgs = h.portMessages.filter((m) => (m as { type?: string }).type === 'SESSIONS')
+    expect(msgs).toHaveLength(1)
+    const sessions = (msgs[0] as { sessions: Array<{ sessionId: string }> }).sessions
+    expect(sessions.map((s) => s.sessionId)).toEqual(['a'])
+  })
+
+  it('SEND_MARK 缺 mark.index：malformed 且不发 rpc', async () => {
+    const h = setup()
+    const fetchMock = vi.fn(() => Promise.reject(new Error('no server in test')))
+    vi.stubGlobal('fetch', fetchMock)
+    await import('./background.ts')
+    h.fireConnect()
+    await flush()
+    h.portMessages.length = 0
+    const before = fetchMock.mock.calls.length
+    h.firePanelMessage({ type: 'SEND_MARK', sessionId: 's1', mark: { selector: 'div' }, comment: 'c', tabId: 5 })
+    await flush()
+    const results = h.portMessages.filter((m) => (m as { type?: string }).type === 'SEND_RESULT')
+    expect(results).toHaveLength(1)
+    expect(results[0]).toMatchObject({ ok: false, error: 'malformed SEND_MARK' })
+    expect(fetchMock.mock.calls.length).toBe(before)
   })
 })

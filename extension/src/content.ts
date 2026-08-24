@@ -163,6 +163,7 @@ function onClick(e: MouseEvent): void {
 
 function onKeyDown(e: KeyboardEvent): void {
   if (!chrome.runtime?.id) return // 同上：失效旧实例静默
+  if (e.repeat) return // 2026-08-24: 长按 repeat 会反复 toggle 标记态，只认第一次
   if (e.key === 'Escape' && state.marking) {
     setMarking(false)
     syncMarkingState()

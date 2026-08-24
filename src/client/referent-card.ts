@@ -127,16 +127,27 @@ function buildCard(payload: ReferentPayload): HTMLElement {
   }
 
   if (payload.source.title || payload.source.url) {
+    // 2026-08-24: the URL comes from message content — only http(s) may become
+    // a link; javascript:/data: and unparseable values render as plain text.
+    let safeUrl: string | null = null
     if (payload.source.url) {
+      try {
+        const u = new URL(payload.source.url)
+        if (u.protocol === 'http:' || u.protocol === 'https:') safeUrl = payload.source.url
+      } catch {
+        safeUrl = null
+      }
+    }
+    if (safeUrl !== null) {
       const link = document.createElement('a')
-      link.href = payload.source.url
+      link.href = safeUrl
       link.target = '_blank'
       link.rel = 'noopener noreferrer'
-      link.title = payload.source.url
-      link.textContent = payload.source.title || payload.source.url
+      link.title = safeUrl
+      link.textContent = payload.source.title || safeUrl
       row('来源：', link, 'dsh-point-referent-source')
     } else {
-      row('来源：', payload.source.title!, 'dsh-point-referent-source')
+      row('来源：', payload.source.title || payload.source.url!, 'dsh-point-referent-source')
     }
   }
   if (payload.selector) row('选择器：', payload.selector)

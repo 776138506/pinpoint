@@ -145,15 +145,18 @@ export function PointDock({ useStore, actions, sendMark, sendAll, editInComposer
       createElement('span', {}, `待发所指（${pending.length}）`),
       createElement('span', { style: { display: 'flex', gap: '8px' } },
         btn(expanded ? '收起' : '展开', () => { setExpanded(!expanded) }),
-        btn('统一发送', () => { void sendBatchUnified() }, busyAll),
-        btn('逐条发送', () => { void sendBatchSequential() }, busyAll),
+        // 2026-08-24: any in-flight send (single or batch) disables every send
+        // path — otherwise a single send and a batch send can run concurrently
+        // and double-deliver the same mark.
+        btn('统一发送', () => { void sendBatchUnified() }, busyAll || busyOne !== null),
+        btn('逐条发送', () => { void sendBatchSequential() }, busyAll || busyOne !== null),
       ),
     ),
     expanded
       ? pending.map(mark =>
         createElement('div', { key: mark.index, style: rowStyle },
           createElement('span', { style: previewStyle }, `#${mark.index} ${mark.source}：${mark.comment || mark.text || '（无备注）'}`),
-          btn('发送', () => { void sendSingle(mark) }, busyAll || busyOne === mark.index),
+          btn('发送', () => { void sendSingle(mark) }, busyAll || busyOne !== null),
           btn('回输入框', () => {
             try {
               editInComposer(mark, mark.comment ?? '')
@@ -162,8 +165,8 @@ export function PointDock({ useStore, actions, sendMark, sendAll, editInComposer
               const reason = error instanceof Error ? error.message : String(error)
               notify(`无法插入草稿：${reason}。`)
             }
-          }, busyAll || busyOne === mark.index),
-          btn('删除', () => { actions.removeMark(mark.index) }, busyAll || busyOne === mark.index, true),
+          }, busyAll || busyOne !== null),
+          btn('删除', () => { actions.removeMark(mark.index) }, busyAll || busyOne !== null, true),
         ),
       )
       : null,
