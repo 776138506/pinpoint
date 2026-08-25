@@ -8,6 +8,7 @@
  */
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import html2canvas from 'html2canvas'
 import { composeScreenshot } from '../../src/client/drawing.ts'
 
 const FAKE_SCREENSHOT = 'data:image/png;base64,fake'
@@ -704,5 +705,91 @@ describe('扩展侧页面白板模式（2026-08-25：画笔涂抹 → 截图发 
     const penBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
       .find(b => b.dataset.tool === 'pen')!
     expect(penBtn.classList.contains('active')).toBe(false)
+  })
+})
+
+describe('扩展侧性能路径（2026-08-25：视口快速截图 / 落笔采样）', () => {
+  function stubScroll(x: number, y: number): void {
+    Object.defineProperty(window, 'scrollX', { configurable: true, get: () => x })
+    Object.defineProperty(window, 'scrollY', { configurable: true, get: () => y })
+  }
+  function stubDocSize(w: number, h: number): void {
+    Object.defineProperty(document.documentElement, 'scrollWidth', { configurable: true, get: () => w })
+    Object.defineProperty(document.documentElement, 'scrollHeight', { configurable: true, get: () => h })
+  }
+  afterEach(() => { stubScroll(0, 0); stubDocSize(0, 0) })
+
+  it('视口内区域：视口窗口 + 视口坐标裁剪（快速路径，不撑整文档）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    stubScroll(0, 100)
+    const target = document.createElement('div')
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 10, clientY: 20 },
+      { type: 'mousemove', clientX: 40, clientY: 60 },
+      { type: 'mouseup', clientX: 40, clientY: 60 },
+    ])
+    await flushAsync()
+
+    const opts = vi.mocked(html2canvas).mock.calls.at(-1)?.[1] as Record<string, unknown>
+    // 文档坐标 rect=(10,120,30,40)，裁剪换算回视口坐标；不传 windowWidth/Height
+    expect(opts.x).toBe(10)
+    expect(opts.y).toBe(20)
+    expect(opts.width).toBe(30)
+    expect(opts.height).toBe(40)
+    expect(opts.windowWidth).toBeUndefined()
+    expect(opts.windowHeight).toBeUndefined()
+  })
+
+  it('拖拽中滚动导致区域跨视口：整文档窗口 + 文档坐标（慢速兜底）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    stubDocSize(1000, 2000)
+    const target = document.createElement('div')
+    document.body.appendChild(target)
+
+    stubScroll(0, 0)
+    target.dispatchEvent(new MouseEvent('mousedown', { clientX: 10, clientY: 20, bubbles: true }))
+    stubScroll(0, 500)
+    target.dispatchEvent(new MouseEvent('mousemove', { clientX: 60, clientY: 120, bubbles: true }))
+    target.dispatchEvent(new MouseEvent('mouseup', { clientX: 60, clientY: 120, bubbles: true }))
+    await flushAsync()
+
+    const opts = vi.mocked(html2canvas).mock.calls.at(-1)?.[1] as Record<string, unknown>
+    // rect=(10,20,50,600)，起点已滚出视口 → 慢速路径
+    expect(opts.x).toBe(10)
+    expect(opts.y).toBe(20)
+    expect(opts.windowWidth).toBe(1000)
+    expect(opts.windowHeight).toBe(2000)
+  })
+
+  it('画笔落笔采样：<2px 移动不产生新点', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    vi.mocked(composeScreenshot).mockClear()
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'START_DRAWING' })
+    const canvas = document.querySelector<HTMLCanvasElement>('.dsh-point-ext-board')!
+
+    canvas.dispatchEvent(new MouseEvent('mousedown', { clientX: 100, clientY: 100, button: 0, bubbles: true }))
+    canvas.dispatchEvent(new MouseEvent('mousemove', { clientX: 101, clientY: 100, bubbles: true })) // 距 1px，丢弃
+    canvas.dispatchEvent(new MouseEvent('mousemove', { clientX: 103, clientY: 100, bubbles: true })) // 距起点 3px，采
+    canvas.dispatchEvent(new MouseEvent('mouseup', { clientX: 104, clientY: 100, bubbles: true }))   // 距上点 1px，不补
+
+    Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '完成')!.click()
+    await flushAsync()
+    await flushAsync()
+
+    document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-popup-btn.primary')[0]!.click()
+    await flushAsync()
+
+    const strokes = vi.mocked(composeScreenshot).mock.calls[0]?.[1] as Array<{ points: number[] }>
+    // [down(100,100)×2, 采样点(103,100)] = 6 个数；1px 抖动与结尾小位移都被采掉
+    expect(strokes[0]!.points).toHaveLength(6)
   })
 })

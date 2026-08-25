@@ -424,6 +424,19 @@ function redrawBoard(): void {
   drawStrokes(boardCtx, all.map(toView), vw, vh)
 }
 
+let boardRafPending = false
+
+// 2026-08-25: 渲染合帧——mousemove 高频触发，每帧最多重绘一次；
+// 配合落笔采样（onBoardMove），避免涂抹越久越卡。
+// ponytail 上限：笔迹极多时全量重绘仍可能掉帧，升级路径是双画布分层
+// （底笔迹一次栅格化 + 活动笔迹单独层）
+function scheduleBoardRedraw(): void {
+  if (boardRafPending) return
+  if (typeof requestAnimationFrame !== 'function') { redrawBoard(); return } // jsdom 无 rAF
+  boardRafPending = true
+  requestAnimationFrame(() => { boardRafPending = false; redrawBoard() })
+}
+
 function onBoardDown(e: MouseEvent): void {
   if (!chrome.runtime?.id) return
   if (e.button !== 0) return
@@ -444,7 +457,7 @@ function onBoardDown(e: MouseEvent): void {
   }
   const p = boardPoint(e)
   boardActive = { tool: boardTool, points: [p.x, p.y, p.x, p.y] }
-  redrawBoard()
+  scheduleBoardRedraw()
 }
 
 function onBoardMove(e: MouseEvent): void {
@@ -452,13 +465,18 @@ function onBoardMove(e: MouseEvent): void {
   e.preventDefault()
   const p = boardPoint(e)
   if (boardActive.tool === 'pen') {
-    boardActive.points.push(p.x, p.y)
+    // 2026-08-25: 落笔采样——<2px 的移动不产生新点，长涂抹的点数降一个量级
+    const pts = boardActive.points
+    const lx = pts[pts.length - 2]!
+    const ly = pts[pts.length - 1]!
+    if (Math.hypot(p.x - lx, p.y - ly) < 2) return
+    pts.push(p.x, p.y)
   } else {
     // arrow/rect：终点跟随当前位置
     boardActive.points[2] = p.x
     boardActive.points[3] = p.y
   }
-  redrawBoard()
+  scheduleBoardRedraw()
 }
 
 function onBoardUp(e: MouseEvent): void {
@@ -466,14 +484,17 @@ function onBoardUp(e: MouseEvent): void {
   e.preventDefault()
   const p = boardPoint(e)
   if (boardActive.tool === 'pen') {
-    boardActive.points.push(p.x, p.y)
+    const pts = boardActive.points
+    const lx = pts[pts.length - 2]!
+    const ly = pts[pts.length - 1]!
+    if (Math.hypot(p.x - lx, p.y - ly) >= 2) pts.push(p.x, p.y)
   } else {
     boardActive.points[2] = p.x
     boardActive.points[3] = p.y
   }
   boardStrokes.push(boardActive)
   boardActive = null
-  redrawBoard()
+  scheduleBoardRedraw()
 }
 
 async function finishBoard(): Promise<void> {
@@ -722,6 +743,15 @@ async function captureRegionInner(rect: { x: number; y: number; width: number; h
 
   try {
     const de = document.documentElement
+    // 2026-08-25: 视口内区域走快速路径——克隆窗口保持视口大小、裁剪坐标换算成
+    // 视口坐标。布局/媒体查询与用户当前所见一致（更保真），且免去整文档渲染
+    // （长页面截图卡顿大头）。只有超出视口的区域才撑整文档窗口（慢速兜底）。
+    const sx = window.scrollX
+    const sy = window.scrollY
+    const inViewport = rect.x >= sx && rect.y >= sy
+      && rect.x + rect.width <= sx + window.innerWidth
+      && rect.y + rect.height <= sy + window.innerHeight
+    const startedAt = performance.now()
     const canvas = await Promise.race([
       html2canvas(document.documentElement, {
         backgroundColor: '#ffffff',
@@ -729,18 +759,17 @@ async function captureRegionInner(rect: { x: number; y: number; width: number; h
         logging: false,
         useCORS: true,
         allowTaint: false,
-        x: rect.x,
-        y: rect.y,
+        x: inViewport ? rect.x - sx : rect.x,
+        y: inViewport ? rect.y - sy : rect.y,
         width: rect.width,
         height: rect.height,
-        // 2026-08-25: html2canvas 克隆渲染默认只铺视口大小，页面滚动后按文档坐标
-        // 裁剪会错位/空白；撑到整文档尺寸。ponytail: 克隆窗口变宽可能触发响应式
-        // 媒体查询差异，可接受
-        windowWidth: de.scrollWidth > 0 ? de.scrollWidth : undefined,
-        windowHeight: de.scrollHeight > 0 ? de.scrollHeight : undefined,
+        windowWidth: !inViewport && de.scrollWidth > 0 ? de.scrollWidth : undefined,
+        windowHeight: !inViewport && de.scrollHeight > 0 ? de.scrollHeight : undefined,
       }),
       new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`截图超时（${extSettings.screenshotTimeoutMs}ms）`)), extSettings.screenshotTimeoutMs)),
     ])
+    // 实机性能观测点：卡顿时让用户开控制台看这个耗时即可定位是哪个路径慢
+    console.debug(`[dsh-point-ext] region screenshot took ${Math.round(performance.now() - startedAt)}ms (${inViewport ? 'viewport' : 'full-document'} path)`)
     mark.screenshot = canvas.toDataURL('image/png')
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e)
