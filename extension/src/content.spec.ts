@@ -559,7 +559,10 @@ describe('扩展侧页面白板模式（2026-08-25：画笔涂抹 → 截图发 
     expect(s.marks).toHaveLength(0)
   })
 
-  it('Esc 退出白板：画布移除、无 mark、标记态不受影响', async () => {
+  // 2026-08-25 契约更新（用户实机报告：点画笔后仍处标记态、只能用标记）：
+  // 两模式从「并存」改为「互斥」——进白板自动退标记并同步 background，反之亦然。
+  // 已有标记的边框/角标保持显示（两模式互证不变），互斥的只是输入捕获态。
+  it('Esc 退出白板：画布移除、无 mark、标记保持退出（互斥契约）', async () => {
     const h = setup()
     await import('./content.ts')
     h.fireMessage({ type: 'TOGGLE_MARKING' })
@@ -573,11 +576,35 @@ describe('扩展侧页面白板模式（2026-08-25：画笔涂抹 → 截图发 
     // 标记态不断言 body 类名——存活旧实例也会响应 Esc 把共享 body 类名摘掉；
     // 改断言本实例状态（GET_STATE 是实例级的，不受串扰）
     const s = h.fireMessage({ type: 'GET_STATE' }) as { marking: boolean; marks: unknown[] }
-    expect(s.marking).toBe(true)
+    expect(s.marking).toBe(false)
     expect(s.marks).toHaveLength(0)
   })
 
-  it('白板模式下画布接管点击，不触发元素捕获（两模式并存不互抢）', async () => {
+  it('进入白板自动退出标记态并同步 background（互斥：侧栏按钮不停在「退出标记」）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    startBoard(h)
+
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marking: boolean }
+    expect(s.marking).toBe(false)
+    expect(h.sendMessage).toHaveBeenCalledWith({ type: 'MARKING_STATE_SYNC', marking: false })
+  })
+
+  it('白板中开启标记：白板退出（互斥反向）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    startBoard(h)
+
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+
+    expect(document.querySelector('.dsh-point-ext-board')).toBeNull()
+    expect(document.querySelector('.dsh-point-ext-board-toolbar')).toBeNull()
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marking: boolean }
+    expect(s.marking).toBe(true)
+  })
+
+  it('白板模式下画布接管点击，不触发元素捕获', async () => {
     const h = setup()
     await import('./content.ts')
     h.fireMessage({ type: 'TOGGLE_MARKING' })
@@ -692,3 +719,105 @@ describe('扩展侧性能路径（2026-08-25：视口快速截图 / 落笔采样
   })
 })
 
+
+describe('标记态点击拦截（2026-08-25：点链接/按钮不触发页面行为）', () => {
+  it('标记态点击链接：拦截默认导航与页面 click 监听器，正常完成捕获', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const a = document.createElement('a')
+    a.href = 'https://example.com/'
+    a.id = 'ext-link'
+    a.textContent = 'link'
+    document.body.appendChild(a)
+    const pageListener = vi.fn()
+    a.addEventListener('click', pageListener)
+
+    const evt = new MouseEvent('click', { bubbles: true, cancelable: true })
+    a.dispatchEvent(evt)
+    await flushAsync()
+
+    expect(evt.defaultPrevented).toBe(true)
+    expect(pageListener).not.toHaveBeenCalled()
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ selector: string }> }
+    expect(s.marks).toHaveLength(1)
+    expect(s.marks[0]!.selector).toBe('#ext-link')
+  })
+
+  it('拖拽框选起于链接：mouseup 后的 click 同样被拦截（suppressClick 路径）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const a = document.createElement('a')
+    a.href = 'https://example.com/'
+    a.style.display = 'block'
+    a.style.width = '500px'
+    a.style.height = '500px'
+    document.body.appendChild(a)
+    const pageListener = vi.fn()
+    a.addEventListener('click', pageListener)
+
+    dispatchMouseSequence(a, [
+      { type: 'mousedown', clientX: 10, clientY: 20 },
+      { type: 'mousemove', clientX: 40, clientY: 60 },
+      { type: 'mouseup', clientX: 40, clientY: 60 },
+    ])
+    const evt = new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 40, clientY: 60 })
+    a.dispatchEvent(evt)
+    await flushAsync()
+
+    expect(evt.defaultPrevented).toBe(true)
+    expect(pageListener).not.toHaveBeenCalled()
+    // 框选 region mark 照常生成
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ selector: string }> }
+    expect(s.marks).toHaveLength(1)
+    expect(s.marks[0]!.selector).toMatch(/^region:/)
+  })
+
+  it('非标记态不拦截页面点击（页面行为不受扩展影响）', async () => {
+    setup()
+    await import('./content.ts')
+    // jsdom 里存活旧实例共享 document 且标记态可能为 true——真实浏览器中扩展重载后
+    // 旧实例因 chrome.runtime.id 失效（undefined）而静默，这里复刻同一失效机制，
+    // 隔离出「无标记态干扰下的页面点击」契约（整删 chrome 会让旧实例抛 ReferenceError）
+    vi.stubGlobal('chrome', { runtime: { id: undefined } })
+    const a = document.createElement('a')
+    document.body.appendChild(a)
+    const pageListener = vi.fn()
+    a.addEventListener('click', pageListener)
+
+    const evt = new MouseEvent('click', { bubbles: true, cancelable: true })
+    a.dispatchEvent(evt)
+
+    expect(evt.defaultPrevented).toBe(false)
+    expect(pageListener).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('评论窗长截图溢出（2026-08-25：暂存/发送按钮须始终可达）', () => {
+  it('截图装入独立滚动容器，弹窗整体限高，按钮留在可视区', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const div = document.createElement('div')
+    div.id = 'ext-tall'
+    div.textContent = 'tall'
+    document.body.appendChild(div)
+
+    div.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await flushAsync()
+
+    const wrap = document.querySelector('.dsh-point-ext-popup-shot-wrap')
+    expect(wrap).not.toBeNull()
+    expect(wrap!.querySelector('img.dsh-point-ext-popup-shot')).not.toBeNull()
+    // 按钮容器在 DOM 上位于截图容器之后，不被挤出弹窗
+    const popup = document.querySelector('.dsh-point-ext-popup')!
+    const children = Array.from(popup.children).map(c => c.className)
+    expect(children.indexOf('dsh-point-ext-popup-shot-wrap')).toBeGreaterThan(-1)
+    expect(children.indexOf('dsh-point-ext-popup-actions')).toBeGreaterThan(children.indexOf('dsh-point-ext-popup-shot-wrap'))
+    // 样式含视口上限与滚动容器
+    const styleText = Array.from(document.querySelectorAll('style')).map(s => s.textContent ?? '').join('\n')
+    expect(styleText).toContain('.dsh-point-ext-popup-shot-wrap')
+    expect(styleText).toContain('max-height: calc(100vh - 16px)')
+  })
+})

@@ -290,15 +290,26 @@ function onMouseUp(e: MouseEvent): void {
 function onClick(e: MouseEvent): void {
   if (!chrome.runtime?.id) return // 同上：失效旧实例静默
   if (!state.marking) return
+  const el = e.target as Element
+  if (!el || el.nodeType !== 1) return
+  // 2026-08-25: 自身 UI 的点击永不拦截、也不消耗 suppressClick——必须在 suppressClick
+  // 检查之前：拖拽产生的 suppressClick 会存到下一次点击，若下次点的是弹窗按钮
+  // （暂存/发送），拦截会把按钮点击吞掉（实机必现：框选后点发送无反应）
+  if ((el as Element).closest(OWN_UI_SELECTOR)) return
   // 2026-08-24: a region drag consumes the click; do not also capture the
   // element under the mouseup.
   if (suppressClick) {
     suppressClick = false
+    // 2026-08-25: 拖拽起于链接/按钮时，mouseup 后的 click 仍会触发导航与页面
+    // 监听器（用户实机报告点链接直接跳转），suppress 路径同样要拦
+    e.preventDefault()
+    e.stopPropagation()
     return
   }
-  const el = e.target as Element
-  if (!el || el.nodeType !== 1) return
-  if ((el as Element).closest(OWN_UI_SELECTOR)) return
+  // 2026-08-25: 标记态点击 = 捕获所指，不是页面交互——拦截链接默认导航与页面
+  // 自身的 click 处理器（capture 阶段 stopPropagation，页面监听器收不到）
+  e.preventDefault()
+  e.stopPropagation()
   // 2026-08-21: 点已标记元素（或其子元素）= 重开评论窗，不重复捕获
   const marked = findMarkedAncestor(el)
   if (marked) {
@@ -531,6 +542,13 @@ async function finishBoard(): Promise<void> {
 
 function enterDrawingMode(): void {
   if (drawingMode) return
+  // 2026-08-25: 两模式互斥——进白板先退标记（setMarking(false) 会顺便了结草稿、
+  // 关评论窗），并同步 background 的按 tab 状态，否则侧栏按钮停在「退出标记」。
+  // 已有标记的边框/角标不撤，白板中仍可对照（两模式互证）
+  if (state.marking) {
+    setMarking(false)
+    syncMarkingState()
+  }
   drawingMode = true
   boardStrokes = []
   boardActive = null
@@ -793,6 +811,9 @@ function setMarking(on: boolean): void {
     settleDraft()
     if (state.activeIndex !== null) openMark(null)
   }
+  // 2026-08-25: 两模式互斥（用户实机报告画笔与标记并存冲突）——进标记退白板。
+  // 所有开启路径（TOGGLE/SET/快捷键/侧栏）都汇聚到此，一处兜底
+  if (on && drawingMode) exitDrawingMode()
   setState({ ...state, marking: on })
   if (on) {
     showHint('标记模式已开启：悬停高亮，点击元素捕获所指。按 Esc 退出。')
@@ -1133,12 +1154,16 @@ function renderPopup(): void {
 
   // 2026-08-25: 评论窗白板已移除（用户拍板：涂抹只有「页面白板」一个入口，
   // 两套绘画工具并存反而造成混乱）。截图只读预览，想标注就用页面白板再画一张。
+  // 截图包进独立滚动容器——长截图不再把暂存/发送按钮挤出视口（用户实机报告）
   if (mark.screenshot) {
+    const wrap = document.createElement('div')
+    wrap.className = 'dsh-point-ext-popup-shot-wrap'
     const img = document.createElement('img')
     img.className = 'dsh-point-ext-popup-shot'
     img.src = mark.screenshot
     img.alt = '所指截图'
-    container.appendChild(img)
+    wrap.appendChild(img)
+    container.appendChild(wrap)
   }
 
   const actions = document.createElement('div')
@@ -1338,7 +1363,14 @@ body.dsh-point-ext-marking .dsh-point-ext-badge { cursor: pointer; }
   font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
   color: #1f2328;
   overflow: hidden;
+  /* 2026-08-25: flex 列布局 + 视口限高——长截图时收缩的是截图滚动容器，
+     header/输入框/按钮始终可见（原实现无 max-height，按钮被推出视口点不到） */
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 16px);
 }
+.dsh-point-ext-popup > * { flex: none; }
+.dsh-point-ext-popup > .dsh-point-ext-popup-shot-wrap { flex: 0 1 auto; }
 .dsh-point-ext-popup-header {
   display: flex;
   align-items: center;
@@ -1464,14 +1496,21 @@ body.dsh-point-ext-marking .dsh-point-ext-badge { cursor: pointer; }
   border-color: #2563eb;
   color: #ffffff;
 }
-/* 2026-08-25: 评论窗截图只读预览（白板唯一入口=页面白板，评论窗不再内嵌绘画） */
-.dsh-point-ext-popup-shot {
-  display: block;
-  width: calc(100% - 24px);
+/* 2026-08-25: 评论窗截图只读预览（白板唯一入口=页面白板，评论窗不再内嵌绘画）。
+   截图装在独立滚动容器里：超高截图在容器内滚动，不撑爆弹窗、不挤走按钮 */
+.dsh-point-ext-popup-shot-wrap {
+  max-height: 32vh;
+  min-height: 60px;
+  overflow-y: auto;
+  overflow-x: hidden;
   margin: 10px 12px;
   border: 1px solid #e5e7eb;
   border-radius: 6px;
   background: #f9fafb;
+}
+.dsh-point-ext-popup-shot {
+  display: block;
+  width: 100%;
 }
 `
   document.head.appendChild(style)
