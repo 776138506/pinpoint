@@ -43,6 +43,13 @@
       padding: 8px 0;
     }
     .outbox-item:last-child { border-bottom: none; padding-bottom: 0; }
+    /* 2026-08-25: 暂存区截图缩略图——限高裁顶（长截图占大头的是中段，顶部最能辨认） */
+    .outbox-shot {
+      display: block; width: 100%; max-height: 120px; object-fit: cover; object-position: top;
+      border: 1px solid #e5e7eb; border-radius: 6px; margin-bottom: 6px;
+      cursor: pointer; background: #f3f4f6;
+    }
+    .outbox-shot:hover { border-color: #2563eb; }
     .outbox-info { font-size: 12px; word-break: break-all; cursor: pointer; }
     .outbox-info:hover { color: #2563eb; }
     .outbox-meta { font-size: 11px; color: #6b7280; margin-top: 2px; }

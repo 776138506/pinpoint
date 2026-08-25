@@ -214,6 +214,18 @@ function renderOutbox(): void {
     const row = document.createElement('div')
     row.className = 'outbox-item'
 
+    // 2026-08-25: 暂存区直接展示所指截图（用户要求——纯文本 `#1 · 文本` 认不出哪条是哪条）。
+    // 截图缺失（跨域失败/旧版本暂存）时不渲染占位，保持原有文本行
+    if (item.mark.screenshot) {
+      const shot = document.createElement('img')
+      shot.className = 'outbox-shot'
+      shot.src = item.mark.screenshot
+      shot.alt = `所指 #${item.mark.index} 截图`
+      shot.title = '点击跳转到页面中的标记位置'
+      shot.addEventListener('click', () => focusItem(item))
+      row.appendChild(shot)
+    }
+
     const info = document.createElement('div')
     info.className = 'outbox-info'
     info.textContent = `#${item.mark.index} · ${item.mark.text || '（无可见文本）'}`

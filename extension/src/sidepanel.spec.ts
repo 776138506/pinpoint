@@ -258,3 +258,21 @@ describe('connect 持续失败（扩展失效）的退避与放弃（2026-08-24�
     }
   })
 })
+
+describe('暂存区截图缩略图（2026-08-25：用户要求在暂存区直接看到截图）', () => {
+  it('有截图的暂存项渲染缩略图，无截图的不渲染', async () => {
+    const h = setup()
+    await import('./sidepanel.ts')
+    const port = h.ports[0]
+    port.fireMessage({ type: 'SESSIONS', sessions: [{ sessionId: 's1', updatedAt: 1, title: 's' }] })
+    port.fireMessage({ type: 'STAGE_MARK', mark: { ...MARK, index: 1, screenshot: 'data:image/png;base64,fake1' }, tabId: 5 })
+    port.fireMessage({ type: 'STAGE_MARK', mark: { ...MARK, index: 2, screenshot: '' }, tabId: 5 })
+    await flush()
+
+    const items = document.querySelectorAll('.outbox-item')
+    expect(items).toHaveLength(2)
+    const shot = items[0]!.querySelector('img.outbox-shot')
+    expect(shot?.getAttribute('src')).toBe('data:image/png;base64,fake1')
+    expect(items[1]!.querySelector('img.outbox-shot')).toBeNull()
+  })
+})
