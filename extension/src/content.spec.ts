@@ -987,6 +987,44 @@ describe('捕获即暂停、了结即恢复（2026-08-25：评论子流程不与
     expect(syncTrue).toHaveLength(0)
   })
 
+  it('关闭按钮（×）：已输入评论默认暂存不丢失（2026-08-25 用户拍板，与 Esc 同语义）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+
+    const ta = document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!
+    ta.value = '写到一半的评论'
+    document.querySelector<HTMLButtonElement>('.dsh-point-ext-popup-close')!.click()
+    await flushAsync()
+
+    const s = getState(h)
+    expect(s.marks).toHaveLength(1)
+    expect(s.marks[0]!.status).toBe('pending')
+    const stageCalls = h.sendMessage.mock.calls.filter(
+      c => (c[0] as { type?: string }).type === 'STAGE_MARK',
+    )
+    expect(stageCalls).toHaveLength(1)
+    expect((stageCalls[0]![0] as { mark: { comment: string } }).mark.comment).toBe('写到一半的评论')
+    // 关闭属「了结」：恢复被暂停的标记
+    expect(s.marking).toBe(true)
+    expect(document.querySelector('.dsh-point-ext-popup')).toBeNull()
+  })
+
+  it('关闭按钮（×）未输入评论：撤销该标记（无孤儿高亮），恢复标记', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+
+    document.querySelector<HTMLButtonElement>('.dsh-point-ext-popup-close')!.click()
+    await flushAsync()
+
+    expect(getState(h).marks).toHaveLength(0)
+    expect(getState(h).marking).toBe(true)
+    expect(document.querySelector('.dsh-point-ext-popup')).toBeNull()
+  })
+
   it('标记本就关闭时打开/关闭评论窗（角标路径）：不产生意外标记态', async () => {
     const h = setup()
     await import('./content.ts')

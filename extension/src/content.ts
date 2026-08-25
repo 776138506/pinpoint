@@ -1166,10 +1166,10 @@ function renderPopup(): void {
   closeBtn.title = '关闭'
   closeBtn.addEventListener('click', (e) => {
     e.stopPropagation()
-    // 2026-08-21: 草稿态（未暂存/未发送）关闭评论窗 = 放弃该标记，
-    // 否则页面留孤儿高亮而暂存区无记录，再点同元素还会重复捕获
-    if (mark.status === 'draft') removeMark(mark.index)
-    else openMark(null)
+    // 2026-08-25: 关闭 = 默认暂存（用户拍板，与 Esc 同语义）——已输入的评论进
+    // 暂存区不丢失；无评论才撤销（保持「页面高亮 ⇔ 暂存区有记录」不变量）
+    settleDraft()
+    openMark(null)
     resumeMarking() // 2026-08-25: 了结评论子流程，恢复被弹窗暂停的标记
   })
   header.appendChild(closeBtn)
