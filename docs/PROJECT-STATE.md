@@ -23,6 +23,15 @@
 
 ## 变更日志
 
+### 2026-08-25：绘画入口统一——移除评论窗白板（用户拍板）
+
+- 决策依据：用户视角「画」只有一个动作，两套一样外观、不同行为的绘画入口（页面白板 vs 评论窗截图白板）造成混乱；页面白板能覆盖评论窗白板的全部场景（标注→完成→评论→发送），评论窗白板反向不行
+- 移除：renderDrawingLayer/redrawCanvas/deactivateDrawingTool、currentTool/activeStroke/drawingCanvas/drawingCtx 模块态、Esc 工具态层级、drawing-* CSS，共 ~250 行
+- 保留：评论窗截图改为只读预览（.dsh-point-ext-popup-shot）；strokeMap + composeScreenshot 发送合成管线（页面白板笔迹依赖）
+- 测试净删 6 例（绘画层 3 + 修复 4 移除，白板测试改断言只读预览），130/130 绿
+- 教训（L2 反馈）：功能入口的唯一性优先于局部便利性——「都能画」不等于「都该在」
+
+
 ### 2026-08-25：评论窗绘画层三 bug 修复（补齐不移除）
 
 - 决策：页面白板=画在页面上，评论窗白板=画在将要发出的截图上（WYSIWYG 精修），用途不重合，修而不删

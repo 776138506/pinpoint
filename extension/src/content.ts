@@ -96,11 +96,8 @@ function regionDelta(index: number): { dx: number; dy: number } {
 // 2026-08-24: per-mark whiteboard strokes stored as ratios relative to the
 // original screenshot. Deleted when the mark is removed; composed into the
 // screenshot at send/stage time. ponytail: not persisted (lost on refresh).
+// 2026-08-25: 唯一生产者=页面白板（finishBoard）；评论窗白板已移除
 const strokeMap = new Map<number, Stroke[]>()
-let currentTool: DrawTool | null = null
-let activeStroke: Stroke | null = null
-let drawingCanvas: HTMLCanvasElement | null = null
-let drawingCtx: CanvasRenderingContext2D | null = null
 
 // 2026-08-20: 页面内自定义快捷键（侧栏设置区配置，chrome.storage 共享）。
 // 等于内置 Alt+Shift+M 时不处理——该组合由 manifest commands 全局接管，避免双重切换
@@ -325,14 +322,7 @@ function onKeyDown(e: KeyboardEvent): void {
     return
   }
   if (e.key === 'Escape' && state.marking) {
-    // 2026-08-24: Esc 层级：工具态 > 拖拽态 > 标记态。
-    // 工具态下只退出工具，不退出标记模式，也不关闭 popup。
-    if (currentTool !== null && state.activeIndex !== null) {
-      currentTool = null
-      activeStroke = null
-      deactivateDrawingTool()
-      return
-    }
+    // 2026-08-24: Esc 层级：拖拽态 > 标记态（评论窗白板已移除，无工具态）。
     if (isDragging) {
       isDragging = false
       if (dragRectEl !== null) { dragRectEl.remove(); dragRectEl = null }
@@ -1063,160 +1053,6 @@ function findMarkedAncestor(el: Element): Element | null {
   return null
 }
 
-/* ---------- popup drawing layer ---------- */
-
-// 2026-08-24: screenshot whiteboard for the extension popup.
-function renderDrawingLayer(container: HTMLElement, mark: Mark): { wrapper: HTMLElement } {
-  const wrapper = document.createElement('div')
-  wrapper.className = 'dsh-point-ext-drawing'
-
-  const img = document.createElement('img')
-  img.className = 'dsh-point-ext-drawing-img'
-  img.src = mark.screenshot
-  img.alt = '所指截图'
-
-  const canvas = document.createElement('canvas')
-  canvas.className = 'dsh-point-ext-drawing-canvas'
-  drawingCanvas = canvas
-
-  const toolbar = document.createElement('div')
-  toolbar.className = 'dsh-point-ext-drawing-toolbar'
-
-  const makeTool = (tool: DrawTool, label: string) => {
-    const btn = document.createElement('button')
-    btn.type = 'button'
-    btn.textContent = label
-    btn.dataset.tool = tool
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation()
-      // 2026-08-25: 不再 renderPopup——重建会把正在输入的评论冲掉（textarea 按
-      // mark.comment 重建）；原地切换激活态即可
-      currentTool = currentTool === tool ? null : tool
-      activeStroke = null
-      activateToolStyle()
-    })
-    return btn
-  }
-  const penBtn = makeTool('pen', '画笔')
-  const arrowBtn = makeTool('arrow', '箭头')
-  const rectBtn = makeTool('rect', '矩形')
-  const undoBtn = document.createElement('button')
-  undoBtn.type = 'button'
-  undoBtn.textContent = '撤销'
-  undoBtn.addEventListener('click', (e) => {
-    e.stopPropagation()
-    const strokes = strokeMap.get(mark.index)
-    if (strokes) {
-      strokes.pop()
-      redrawCanvas(mark)
-    }
-  })
-  const clearBtn = document.createElement('button')
-  clearBtn.type = 'button'
-  clearBtn.textContent = '清空'
-  clearBtn.addEventListener('click', (e) => {
-    e.stopPropagation()
-    strokeMap.delete(mark.index)
-    redrawCanvas(mark)
-  })
-  toolbar.appendChild(penBtn)
-  toolbar.appendChild(arrowBtn)
-  toolbar.appendChild(rectBtn)
-  toolbar.appendChild(undoBtn)
-  toolbar.appendChild(clearBtn)
-
-  const activateToolStyle = () => {
-    for (const btn of [penBtn, arrowBtn, rectBtn]) {
-      btn.classList.toggle('active', btn.dataset.tool === currentTool)
-    }
-    canvas.style.pointerEvents = currentTool ? 'auto' : 'none'
-  }
-
-  img.onload = () => {
-    canvas.width = img.naturalWidth
-    canvas.height = img.naturalHeight
-    drawingCtx = canvas.getContext('2d')
-    redrawCanvas(mark)
-    activateToolStyle()
-  }
-  if (img.complete && img.naturalWidth > 0) {
-    canvas.width = img.naturalWidth
-    canvas.height = img.naturalHeight
-    drawingCtx = canvas.getContext('2d')
-    redrawCanvas(mark)
-    activateToolStyle()
-  }
-
-  const toRatio = (e: MouseEvent): { x: number; y: number } => {
-    const rect = canvas.getBoundingClientRect()
-    const scaleX = canvas.width / rect.width
-    const scaleY = canvas.height / rect.height
-    return {
-      x: Math.min(1, Math.max(0, (e.clientX - rect.left) * scaleX / canvas.width)),
-      y: Math.min(1, Math.max(0, (e.clientY - rect.top) * scaleY / canvas.height)),
-    }
-  }
-
-  canvas.addEventListener('mousedown', (e) => {
-    if (!currentTool) return
-    e.preventDefault()
-    const { x, y } = toRatio(e)
-    activeStroke = { tool: currentTool, points: [x, y] }
-  })
-
-  canvas.addEventListener('mousemove', (e) => {
-    if (!currentTool || !activeStroke) return
-    e.preventDefault()
-    const { x, y } = toRatio(e)
-    if (currentTool === 'pen') {
-      activeStroke.points.push(x, y)
-      // 2026-08-25: 带 preview 实时预览——此前不带，笔迹松开鼠标才显示（感觉没画上）
-      redrawCanvas(mark, activeStroke)
-      return
-    }
-    activeStroke.points = [activeStroke.points[0], activeStroke.points[1], x, y]
-    redrawCanvas(mark, activeStroke)
-  })
-
-  const endStroke = () => {
-    if (!currentTool || !activeStroke) return
-    if (activeStroke.points.length >= 4) {
-      const strokes = strokeMap.get(mark.index) ?? []
-      strokes.push(activeStroke)
-      strokeMap.set(mark.index, strokes)
-    }
-    activeStroke = null
-    redrawCanvas(mark)
-  }
-  canvas.addEventListener('mouseup', endStroke)
-  canvas.addEventListener('mouseleave', endStroke)
-
-  // 2026-08-25: 画布必须只盖图片——此前直接挂 wrapper（含工具条），CSS
-  // height:100% 把画布拉长到工具条高度，画的位置与落点纵向错位
-  const imgWrap = document.createElement('div')
-  imgWrap.className = 'dsh-point-ext-drawing-view'
-  imgWrap.appendChild(img)
-  imgWrap.appendChild(canvas)
-  wrapper.appendChild(imgWrap)
-  wrapper.appendChild(toolbar)
-  return { wrapper }
-}
-
-function redrawCanvas(mark: Mark, preview?: Stroke | null): void {
-  if (!drawingCanvas || !drawingCtx) return
-  drawingCtx.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height)
-  const strokes = strokeMap.get(mark.index) ?? []
-  drawStrokes(drawingCtx, preview ? [...strokes, preview] : strokes, drawingCanvas.width, drawingCanvas.height)
-}
-
-// 2026-08-25: 原地取消工具激活——不 renderPopup（重建会把正在输入的评论冲掉）
-function deactivateDrawingTool(): void {
-  const toolbar = popupLayer?.querySelector('.dsh-point-ext-drawing-toolbar')
-  toolbar?.querySelectorAll('button[data-tool]').forEach(b => b.classList.remove('active'))
-  const canvas = popupLayer?.querySelector<HTMLElement>('.dsh-point-ext-drawing-canvas')
-  if (canvas) canvas.style.pointerEvents = 'none'
-}
-
 // 2026-08-24: compose whiteboard strokes onto the screenshot before staging/sending.
 async function composeLocalMark(mark: Mark): Promise<Mark> {
   const strokes = strokeMap.get(mark.index)
@@ -1295,11 +1131,14 @@ function renderPopup(): void {
   meta.textContent = `文本：${mark.text || '（无可见文本）'}`
   container.appendChild(meta)
 
-  // 2026-08-24: screenshot whiteboard. Available only when a screenshot was
-  // actually captured; empty/failed screenshots keep the text-only path.
-  if (mark.screenshot && mark.status !== 'sent') {
-    const { wrapper } = renderDrawingLayer(container, mark)
-    container.appendChild(wrapper)
+  // 2026-08-25: 评论窗白板已移除（用户拍板：涂抹只有「页面白板」一个入口，
+  // 两套绘画工具并存反而造成混乱）。截图只读预览，想标注就用页面白板再画一张。
+  if (mark.screenshot) {
+    const img = document.createElement('img')
+    img.className = 'dsh-point-ext-popup-shot'
+    img.src = mark.screenshot
+    img.alt = '所指截图'
+    container.appendChild(img)
   }
 
   const actions = document.createElement('div')
@@ -1625,52 +1464,14 @@ body.dsh-point-ext-marking .dsh-point-ext-badge { cursor: pointer; }
   border-color: #2563eb;
   color: #ffffff;
 }
-/* 2026-08-24: 评论窗白板绘制层 */
-.dsh-point-ext-drawing {
-  position: relative;
+/* 2026-08-25: 评论窗截图只读预览（白板唯一入口=页面白板，评论窗不再内嵌绘画） */
+.dsh-point-ext-popup-shot {
+  display: block;
+  width: calc(100% - 24px);
   margin: 10px 12px;
   border: 1px solid #e5e7eb;
   border-radius: 6px;
-  overflow: hidden;
   background: #f9fafb;
-}
-/* 2026-08-25: 画布的定位容器只含图片——画布 height:100% 对齐图片而非含工具条的 wrapper */
-.dsh-point-ext-drawing-view {
-  position: relative;
-}
-.dsh-point-ext-drawing-img {
-  display: block;
-  width: 100%;
-  height: auto;
-}
-.dsh-point-ext-drawing-canvas {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-}
-.dsh-point-ext-drawing-toolbar {
-  display: flex;
-  gap: 6px;
-  padding: 6px;
-  background: #ffffff;
-  border-top: 1px solid #e5e7eb;
-}
-.dsh-point-ext-drawing-toolbar button {
-  flex: 1;
-  padding: 4px 6px;
-  font-size: 12px;
-  border: 1px solid #d1d5db;
-  border-radius: 4px;
-  background: #ffffff;
-  cursor: pointer;
-}
-.dsh-point-ext-drawing-toolbar button.active {
-  background: #ff2d55;
-  border-color: #ff2d55;
-  color: #ffffff;
 }
 `
   document.head.appendChild(style)
