@@ -943,7 +943,32 @@ describe('捕获即暂停、了结即恢复（2026-08-25：评论子流程不与
     expect(document.querySelector('.dsh-point-ext-popup')).not.toBeNull()
   })
 
-  it('暂停中按 Esc：关弹窗（草稿删除，同关闭按钮）且不恢复标记（明确退出优先）', async () => {
+  it('暂停中按 Esc：已输入的评论进暂存区不丢失（2026-08-25 用户拍板），不恢复标记', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+
+    const ta = document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!
+    ta.value = '写到一半的评论'
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flushAsync()
+
+    // 草稿了结进暂存区，评论不丢
+    const s = getState(h)
+    expect(s.marks).toHaveLength(1)
+    expect(s.marks[0]!.status).toBe('pending')
+    const stageCalls = h.sendMessage.mock.calls.filter(
+      c => (c[0] as { type?: string }).type === 'STAGE_MARK',
+    )
+    expect(stageCalls).toHaveLength(1)
+    expect((stageCalls[0]![0] as { mark: { comment: string } }).mark.comment).toBe('写到一半的评论')
+    // 弹窗关闭、标记不恢复（明确退出优先）
+    expect(s.marking).toBe(false)
+    expect(document.querySelector('.dsh-point-ext-popup')).toBeNull()
+  })
+
+  it('暂停中按 Esc（未输入评论）：放弃该标记，不恢复标记', async () => {
     const h = setup()
     await import('./content.ts')
     captureDiv(h)

@@ -332,11 +332,10 @@ function onKeyDown(e: KeyboardEvent): void {
     exitDrawingMode()
     return
   }
-  // 2026-08-25: 评论子流程（标记被弹窗暂停）中的 Esc = 明确放弃：与弹窗关闭按钮
-  // 同语义（草稿删除），且属显式退出——不恢复标记
+  // 2026-08-25: 评论子流程（标记被弹窗暂停）中的 Esc = 明确退出：了结草稿——
+  // 已输入的评论自动进暂存区（用户拍板：已输入的不该丢），无评论才撤销；不恢复标记
   if (e.key === 'Escape' && state.activeIndex !== null && markPauseActive) {
-    const m = state.marks.find(mk => mk.index === state.activeIndex)
-    if (m?.status === 'draft') removeMark(m.index)
+    settleDraft()
     openMark(null)
     markPauseActive = false
     return
