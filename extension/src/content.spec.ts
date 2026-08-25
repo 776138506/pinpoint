@@ -7,7 +7,8 @@
  *  ② onMouseOut 缺失效守卫——扩展重载后旧实例会擦掉新实例的悬停高亮
  */
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { composeScreenshot } from '../../src/client/drawing.ts'
 
 const FAKE_SCREENSHOT = 'data:image/png;base64,fake'
 
@@ -27,6 +28,12 @@ vi.mock('html2canvas', () => ({
       height: canvas.height,
     }
   }),
+}))
+
+vi.mock('../../src/client/drawing.ts', () => ({
+  composeScreenshot: vi.fn(async (_screenshot: string, strokes: unknown[]) =>
+    Array.isArray(strokes) && strokes.length > 0 ? 'composed-screenshot' : null),
+  drawStrokes: vi.fn(),
 }))
 
 type MessageListener = (message: unknown, sender: unknown, sendResponse: (r?: unknown) => void) => boolean
@@ -317,5 +324,178 @@ describe('扩展侧区域框选（2026-08-24）', () => {
     // 跨实例残留边框可能让 querySelector 拿到不带 flash 的 stale 元素，直接查组合类名。
     const border = document.querySelector('.dsh-point-ext-region-kept.dsh-point-ext-flash')
     expect(border).not.toBeNull()
+  })
+})
+
+describe('扩展侧框选坐标换算（2026-08-25：滚动漂移 / 超界钳制）', () => {
+  function stubScroll(x: number, y: number): void {
+    Object.defineProperty(window, 'scrollX', { configurable: true, get: () => x })
+    Object.defineProperty(window, 'scrollY', { configurable: true, get: () => y })
+  }
+  function stubDocSize(w: number, h: number): void {
+    Object.defineProperty(document.documentElement, 'scrollWidth', { configurable: true, get: () => w })
+    Object.defineProperty(document.documentElement, 'scrollHeight', { configurable: true, get: () => h })
+  }
+  afterEach(() => { stubScroll(0, 0); stubDocSize(0, 0) })
+
+  it('拖拽中页面滚动：起点用滚动快照换算，区域边界不随页面漂移', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const target = document.createElement('div')
+    document.body.appendChild(target)
+
+    stubScroll(0, 0)
+    target.dispatchEvent(new MouseEvent('mousedown', { clientX: 10, clientY: 20, bubbles: true }))
+    stubScroll(0, 500)
+    target.dispatchEvent(new MouseEvent('mousemove', { clientX: 60, clientY: 120, bubbles: true }))
+    target.dispatchEvent(new MouseEvent('mouseup', { clientX: 60, clientY: 120, bubbles: true }))
+    await flushAsync()
+
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ selector: string }> }
+    expect(s.marks).toHaveLength(1)
+    expect(s.marks[0]!.selector).toBe('region:10,20,50,600')
+  })
+
+  it('框选超出文档范围：钳制到文档边界', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    stubDocSize(800, 600)
+    const target = document.createElement('div')
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 10, clientY: 10 },
+      { type: 'mousemove', clientX: 1000, clientY: 1000 },
+      { type: 'mouseup', clientX: 1000, clientY: 1000 },
+    ])
+    await flushAsync()
+
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ selector: string }> }
+    expect(s.marks).toHaveLength(1)
+    expect(s.marks[0]!.selector).toBe('region:10,10,790,590')
+  })
+
+  it('完全拖出文档范围：不产出 mark', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    stubDocSize(100, 100)
+    const target = document.createElement('div')
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 200, clientY: 200 },
+      { type: 'mousemove', clientX: 300, clientY: 300 },
+      { type: 'mouseup', clientX: 300, clientY: 300 },
+    ])
+    await flushAsync()
+
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ selector: string }> }
+    expect(s.marks).toHaveLength(0)
+  })
+})
+
+describe('扩展侧评论窗绘画层（2026-08-24）', () => {
+  it('有截图的草稿标记弹出绘画工具栏与画布', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const target = document.createElement('div')
+    target.id = 'draw-target'
+    target.textContent = 'x'
+    target.style.width = '500px'
+    target.style.height = '500px'
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 100, clientY: 100 },
+      { type: 'mousemove', clientX: 103, clientY: 105 },
+      { type: 'mouseup', clientX: 103, clientY: 105 },
+      { type: 'click', clientX: 103, clientY: 105 },
+    ])
+    await flushAsync()
+
+    expect(document.querySelector('.dsh-point-ext-drawing')).not.toBeNull()
+    expect(document.querySelector('.dsh-point-ext-drawing-canvas')).not.toBeNull()
+    const buttons = document.querySelectorAll('.dsh-point-ext-drawing-toolbar button')
+    expect(buttons.length).toBe(5)
+    expect(Array.from(buttons).map(b => b.textContent)).toEqual(['画笔', '箭头', '矩形', '撤销', '清空'])
+  })
+
+  it('Esc 层级：工具态下只退出工具，不退出标记模式', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const target = document.createElement('div')
+    target.id = 'esc-target'
+    target.textContent = 'x'
+    target.style.width = '500px'
+    target.style.height = '500px'
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 100, clientY: 100 },
+      { type: 'mousemove', clientX: 103, clientY: 105 },
+      { type: 'mouseup', clientX: 103, clientY: 105 },
+      { type: 'click', clientX: 103, clientY: 105 },
+    ])
+    await flushAsync()
+
+    const penBtn = document.querySelector<HTMLButtonElement>('.dsh-point-ext-drawing-toolbar button[data-tool="pen"]')!
+    penBtn.click()
+    await flushAsync()
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flushAsync()
+
+    // 工具态 Esc 应只退出工具（画笔按钮不再 active）并保留弹窗/画布；
+    // 不判断 MARKING_STATE_SYNC，因为同文件早前用例的 content 实例监听器未清理。
+    const penBtnAfter = document.querySelector<HTMLButtonElement>('.dsh-point-ext-drawing-toolbar button[data-tool="pen"]')!
+    expect(penBtnAfter.classList.contains('active')).toBe(false)
+    expect(document.querySelector('.dsh-point-ext-drawing-canvas')).not.toBeNull()
+  })
+
+  it('发送前合成 strokes 到截图', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const target = document.createElement('div')
+    target.id = 'send-target'
+    target.textContent = 'x'
+    target.style.width = '500px'
+    target.style.height = '500px'
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 100, clientY: 100 },
+      { type: 'mousemove', clientX: 103, clientY: 105 },
+      { type: 'mouseup', clientX: 103, clientY: 105 },
+      { type: 'click', clientX: 103, clientY: 105 },
+    ])
+    await flushAsync()
+
+    // 选中画笔并在画布上画一笔
+    const penBtn = document.querySelector<HTMLButtonElement>('.dsh-point-ext-drawing-toolbar button[data-tool="pen"]')!
+    penBtn.click()
+    await flushAsync()
+    const canvas = document.querySelector<HTMLCanvasElement>('.dsh-point-ext-drawing-canvas')!
+    canvas.dispatchEvent(new MouseEvent('mousedown', { clientX: 10, clientY: 10, bubbles: true }))
+    canvas.dispatchEvent(new MouseEvent('mousemove', { clientX: 20, clientY: 20, bubbles: true }))
+    canvas.dispatchEvent(new MouseEvent('mouseup', { clientX: 20, clientY: 20, bubbles: true }))
+
+    vi.mocked(composeScreenshot).mockClear()
+    const sendBtn = document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-popup-btn.primary')[0]!
+    sendBtn.click()
+    await flushAsync()
+
+    expect(vi.mocked(composeScreenshot)).toHaveBeenCalledTimes(1)
+    const stageCalls = h.sendMessage.mock.calls.filter(
+      c => (c[0] as { type?: string }).type === 'STAGE_MARK',
+    )
+    expect(stageCalls).toHaveLength(1)
+    expect((stageCalls[0]![0] as { mark: { screenshot: string } }).mark.screenshot).toBe('composed-screenshot')
   })
 })

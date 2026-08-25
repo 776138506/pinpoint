@@ -20,6 +20,7 @@ interface PortStub {
 interface Harness {
   connect: ReturnType<typeof vi.fn>
   ports: PortStub[]
+  sessionSet?: ReturnType<typeof vi.fn>
 }
 
 const PANEL_DOM = `
@@ -36,8 +37,10 @@ const PANEL_DOM = `
   <button id="open-options"></button>
 `
 
-function setup(): Harness {
+function setup(savedOutbox?: unknown[]): Harness {
   const ports: PortStub[] = []
+  const sessionSet = vi.fn(() => Promise.resolve())
+  const sessionGet = vi.fn(() => Promise.resolve({ [savedOutbox ? 'panelOutbox' : '']: savedOutbox }))
   const connect = vi.fn(() => {
     const messageListeners: Listener[] = []
     const disconnectListeners: Listener[] = []
@@ -57,6 +60,7 @@ function setup(): Harness {
     runtime: { connect, openOptionsPage: vi.fn() },
     storage: {
       local: { get: () => Promise.resolve({}) },
+      session: { get: sessionGet, set: sessionSet },
       onChanged: { addListener: () => {} },
     },
     tabs: {
@@ -65,7 +69,7 @@ function setup(): Harness {
     },
   })
   document.body.innerHTML = PANEL_DOM
-  return { connect, ports }
+  return { connect, ports, sessionSet }
 }
 
 const MARK = {
@@ -139,6 +143,64 @@ describe('port 断线自动重连', () => {
     expect(posted).toContain('HEALTH_CHECK')
     expect(posted).toContain('LIST_SESSIONS')
   }, 10000)
+})
+
+describe('侧栏暂存区持久化（2026-08-24）', () => {
+  it('暂存项变更后写入 panelOutbox，侧栏重开后完整恢复', async () => {
+    const h = setup()
+    await import('./sidepanel.ts')
+    const port = h.ports[0]
+
+    port.fireMessage({ type: 'STAGE_MARK', mark: { ...MARK, index: 1, comment: 'a' }, tabId: 5 })
+    port.fireMessage({ type: 'STAGE_MARK', mark: { ...MARK, index: 2, comment: 'b' }, tabId: 5 })
+    await flush()
+    expect(document.querySelectorAll('.outbox-item')).toHaveLength(2)
+
+    // 模拟侧栏关闭：清空 DOM，再重开时 session 返回已持久化数据
+    const saved = h.sessionSet?.mock.calls.at(-1)?.[0]?.panelOutbox
+    expect(saved).toHaveLength(2)
+    vi.unstubAllGlobals()
+    vi.resetModules()
+    document.body.innerHTML = PANEL_DOM
+    const h2 = setup(saved)
+    await import('./sidepanel.ts')
+    await flush()
+    const items = document.querySelectorAll('.outbox-item')
+    expect(items).toHaveLength(2)
+    items[0]?.querySelectorAll('button')[1]?.click() // 编辑
+    await flush()
+    expect(document.querySelector<HTMLTextAreaElement>('.outbox-editor textarea')?.value).toBe('a')
+    // 吸收重连定时器
+    await new Promise(r => setTimeout(r, 1300))
+  })
+
+  it('background 冲刷的缓冲项与 panelOutbox 去重：同 (tabId,index) 以新到为准', async () => {
+    const h = setup()
+    await import('./sidepanel.ts')
+    const port = h.ports[0]
+
+    // 先持久化一条旧评论
+    port.fireMessage({ type: 'STAGE_MARK', mark: { ...MARK, index: 1, comment: 'old' }, tabId: 5 })
+    await flush()
+    const saved = h.sessionSet?.mock.calls.at(-1)?.[0]?.panelOutbox
+    expect(saved[0].mark.comment).toBe('old')
+
+    // 模拟重开后 background 冲刷更新版本
+    vi.unstubAllGlobals()
+    vi.resetModules()
+    document.body.innerHTML = PANEL_DOM
+    const h2 = setup(saved)
+    await import('./sidepanel.ts')
+    await flush()
+    h2.ports[0].fireMessage({ type: 'STAGE_MARK', mark: { ...MARK, index: 1, comment: 'new' }, tabId: 5 })
+    await flush()
+    const row = document.querySelector('.outbox-item')
+    row?.querySelectorAll('button')[1]?.click() // 编辑
+    await flush()
+    expect(document.querySelector<HTMLTextAreaElement>('.outbox-editor textarea')?.value).toBe('new')
+    expect(h2.sessionSet?.mock.calls.at(-1)?.[0]?.panelOutbox[0].mark.comment).toBe('new')
+    await new Promise(r => setTimeout(r, 1300))
+  })
 })
 
 describe('connect 持续失败（扩展失效）的退避与放弃（2026-08-24）', () => {

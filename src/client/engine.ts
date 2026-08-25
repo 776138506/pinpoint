@@ -18,6 +18,7 @@
  */
 import html2canvas from 'html2canvas'
 import { cloneForScreenshot, cssPath, detectExternalImages, snippet, visibleText } from './mark-utils.ts'
+import { composeScreenshot, drawStrokes, type DrawTool, type Stroke } from './drawing.ts'
 import type { Mark, MarkingState } from './stores.ts'
 
 /** Write callbacks the engine uses to reach the store (wired by the component). */
@@ -35,6 +36,8 @@ export interface MarkingController {
   mount(): void
   dispose(): void
   sync(state: MarkingState): void
+  /** Take and clear the whiteboard strokes for a mark (called before sending). */
+  consumeStrokes(index: number): Stroke[] | undefined
 }
 
 const HOVER_OUTLINE = '2px solid #ff2d55'
@@ -83,6 +86,10 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
   interface DragState {
     startX: number
     startY: number
+    // 2026-08-25: mousedown 时的滚动快照——拖拽中页面滚动时，起点必须用「起点
+    // 客户区坐标 + 起点滚动」换算文档坐标，否则区域边界随页面漂移
+    startScrollX: number
+    startScrollY: number
     doc: Document
     frame?: HTMLIFrameElement
     officeContainer?: HTMLElement
@@ -94,6 +101,15 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
   // 2026-08-24: region marks have no DOM element, so we keep a persistent
   // border div per mark that follows scroll/resize via repositionAll().
   const regionEls = new Map<number, HTMLElement>()
+
+  // 2026-08-24: per-mark whiteboard strokes stored as ratios relative to the
+  // original screenshot. Deleted when the mark is removed; composed into the
+  // screenshot at send/stage time. ponytail: not persisted (lost on refresh).
+  const strokeMap = new Map<number, Stroke[]>()
+  // Current drawing tool for the open popup; null means the canvas is inactive
+  // and the popup behaves as before (text-only flow).
+  let currentTool: DrawTool | null = null
+  let activeStroke: Stroke | null = null
 
   ensureStyle()
 
@@ -160,12 +176,48 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     ) !== null
   }
 
+  /**
+   * 2026-08-25: 框选坐标统一换算——两端点各自用「客户区坐标 + 当时滚动」换成
+   * 文档坐标（拖拽中滚动也正确），再钳制到文档范围内。文档尺寸不可读
+   * （jsdom/异常页）时不钳制。完全钳没（<2px）返回 null = 放弃本次框选。
+   */
+  function regionRectFromDrag(doc: Document, drag: DragState, e: MouseEvent): { x: number; y: number; width: number; height: number } | null {
+    const win = doc.defaultView
+    const docStartX = drag.startX + drag.startScrollX
+    const docStartY = drag.startY + drag.startScrollY
+    const docCurX = e.clientX + (win?.scrollX ?? 0)
+    const docCurY = e.clientY + (win?.scrollY ?? 0)
+    const de = doc.documentElement
+    const maxX = de.scrollWidth > 0 ? de.scrollWidth : Number.POSITIVE_INFINITY
+    const maxY = de.scrollHeight > 0 ? de.scrollHeight : Number.POSITIVE_INFINITY
+    const x1 = Math.max(0, Math.min(Math.min(docStartX, docCurX), maxX))
+    const y1 = Math.max(0, Math.min(Math.min(docStartY, docCurY), maxY))
+    const x2 = Math.max(0, Math.min(Math.max(docStartX, docCurX), maxX))
+    const y2 = Math.max(0, Math.min(Math.max(docStartY, docCurY), maxY))
+    if (x2 - x1 < 2 || y2 - y1 < 2) return null
+    return {
+      x: Math.round(x1),
+      y: Math.round(y1),
+      width: Math.round(x2 - x1),
+      height: Math.round(y2 - y1),
+    }
+  }
+
   function startDrag(e: MouseEvent, doc: Document, frame?: HTMLIFrameElement): void {
     const el = e.target as Element
     if (!el || el.nodeType !== 1) return
     if (isOwnUI(el)) return
     const officeContainer = !frame ? (el.closest('div[data-office]') as HTMLElement | null) ?? undefined : undefined
-    dragState = { startX: e.clientX, startY: e.clientY, doc, frame, officeContainer }
+    const win = doc.defaultView
+    dragState = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startScrollX: win?.scrollX ?? 0,
+      startScrollY: win?.scrollY ?? 0,
+      doc,
+      frame,
+      officeContainer,
+    }
   }
 
   function updateDrag(e: MouseEvent): void {
@@ -179,22 +231,19 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     // 2026-08-24: 拖拽中阻止文本选择，避免页面内容被高亮。
     e.preventDefault()
     const doc = dragState.doc
-    const win = doc.defaultView
-    const left = Math.min(dragState.startX, e.clientX) + (win?.scrollX ?? 0)
-    const top = Math.min(dragState.startY, e.clientY) + (win?.scrollY ?? 0)
-    const width = Math.abs(dx)
-    const height = Math.abs(dy)
+    const rect = regionRectFromDrag(doc, dragState, e)
+    if (rect === null) { removeDragRect(); return }
     if (dragRectEl === null) {
       dragRectEl = document.createElement('div')
       dragRectEl.className = REGION_RECT_CLASS
-      // Append to the document being marked so coordinates are 1:1 and the
-      // rect scrolls with the content.
-      doc.body.appendChild(dragRectEl)
+      // 2026-08-25: 挂到 documentElement 而非 body——站点给 body 设
+      // position:relative/ margin 时 absolute 相对 body 偏移，框选显示与实际不符
+      doc.documentElement.appendChild(dragRectEl)
     }
-    dragRectEl.style.left = `${left}px`
-    dragRectEl.style.top = `${top}px`
-    dragRectEl.style.width = `${width}px`
-    dragRectEl.style.height = `${height}px`
+    dragRectEl.style.left = `${rect.x}px`
+    dragRectEl.style.top = `${rect.y}px`
+    dragRectEl.style.width = `${rect.width}px`
+    dragRectEl.style.height = `${rect.height}px`
   }
 
   function endDrag(e: MouseEvent): void {
@@ -205,17 +254,10 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     removeDragRect()
     if (dragged) {
       suppressClick = true
-      const doc = dragState.doc
-      const win = doc.defaultView
-      const left = Math.min(dragState.startX, e.clientX) + (win?.scrollX ?? 0)
-      const top = Math.min(dragState.startY, e.clientY) + (win?.scrollY ?? 0)
-      const rect = {
-        x: Math.round(left),
-        y: Math.round(top),
-        width: Math.round(Math.abs(dx)),
-        height: Math.round(Math.abs(dy)),
+      const rect = regionRectFromDrag(dragState.doc, dragState, e)
+      if (rect !== null) {
+        void captureRegion(rect, dragState.frame, dragState.officeContainer)
       }
-      void captureRegion(rect, dragState.frame, dragState.officeContainer)
     }
     dragState = null
   }
@@ -591,6 +633,7 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
       if (typeof html2canvas !== 'function') {
         throw new Error('html2canvas 不可用（未随 client bundle 打包）')
       }
+      const de = captureDoc.documentElement
       const canvas = await html2canvas(captureDoc.documentElement, {
         backgroundColor: '#ffffff',
         scale: 1,
@@ -601,6 +644,11 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
         y: rect.y,
         width: rect.width,
         height: rect.height,
+        // 2026-08-25: html2canvas 的克隆渲染默认只铺视口大小，页面滚动后按文档
+        // 坐标裁剪会错位/空白；把克隆窗口撑到整文档尺寸。ponytail: 窗口宽度变化
+        // 可能触发克隆里的响应式媒体查询，与屏幕渲染略有差异，可接受
+        windowWidth: de.scrollWidth > 0 ? de.scrollWidth : undefined,
+        windowHeight: de.scrollHeight > 0 ? de.scrollHeight : undefined,
       })
       mark.screenshot = canvas.toDataURL('image/png')
     } catch (e) {
@@ -796,7 +844,9 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
           border = ownerDoc.createElement('div')
           border.className = REGION_KEPT_CLASS
           border.dataset.index = String(mark.index)
-          ownerDoc.body.appendChild(border)
+          // 2026-08-25: 挂 documentElement——body 被站点设为 relative 时 absolute
+          // 定位会按 body 偏移，区域边框与框选位置不符
+          ownerDoc.documentElement.appendChild(border)
           regionEls.set(mark.index, border)
         }
         border.style.left = `${resolved.rect.x}px`
@@ -835,6 +885,10 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
   const POPUP_ID = 'dsh-point-popup-layer'
   let popupLayer: HTMLDivElement | null = null
   let popupBusy = false
+  // 2026-08-24: drawing canvas state for the currently open popup.
+  let drawingCanvas: HTMLCanvasElement | null = null
+  let drawingCtx: CanvasRenderingContext2D | null = null
+  let drawingImg: HTMLImageElement | null = null
 
   function ensurePopupLayer(): HTMLDivElement {
     if (popupLayer === null) {
@@ -900,6 +954,13 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     meta.textContent = `文本：${mark.text || '（无可见文本）'}`
     container.appendChild(meta)
 
+    // 2026-08-24: screenshot whiteboard. Available only when a screenshot was
+    // actually captured; empty/failed screenshots keep the text-only path.
+    if (mark.screenshot && mark.status !== 'sent') {
+      const { wrapper } = renderDrawingLayer(container, mark)
+      container.appendChild(wrapper)
+    }
+
     const actions = document.createElement('div')
     actions.className = 'dsh-point-popup-actions'
 
@@ -910,26 +971,7 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     sendBtn.disabled = popupBusy || mark.status === 'sent'
     sendBtn.addEventListener('click', (e) => {
       e.stopPropagation()
-      const comment = textarea.value.trim()
-      if (comment === '') {
-        const ok = window.confirm('评论为空，确认直接发送所指内容？')
-        if (!ok) return
-      }
-      popupBusy = true
-      renderPopup()
-      deps.sendMark(mark, comment).then(
-        () => {
-          popupBusy = false
-          deps.updateMark(mark.index, { status: 'sent', comment })
-          deps.openMark(null)
-        },
-        (error: unknown) => {
-          popupBusy = false
-          renderPopup()
-          const reason = error instanceof Error ? error.message : String(error)
-          showToast(`发送失败：${reason}。请检查网络或会话状态后重试。`)
-        },
-      )
+      void handleSend(mark, textarea.value.trim())
     })
 
     const stageBtn = document.createElement('button')
@@ -939,8 +981,7 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     stageBtn.disabled = popupBusy || mark.status === 'sent'
     stageBtn.addEventListener('click', (e) => {
       e.stopPropagation()
-      deps.updateMark(mark.index, { status: 'pending', comment: textarea.value.trim() })
-      deps.openMark(null)
+      void handleStage(mark, textarea.value.trim())
     })
 
     const delBtn = document.createElement('button')
@@ -950,6 +991,7 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
     delBtn.disabled = popupBusy
     delBtn.addEventListener('click', (e) => {
       e.stopPropagation()
+      strokeMap.delete(mark.index)
       deps.removeMark(mark.index)
       deps.openMark(null)
     })
@@ -963,6 +1005,193 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
 
     layer.appendChild(container)
     repositionPopup()
+  }
+
+  async function handleSend(mark: Mark, comment: string): Promise<void> {
+    if (comment === '') {
+      const ok = window.confirm('评论为空，确认直接发送所指内容？')
+      if (!ok) return
+    }
+    popupBusy = true
+    renderPopup()
+    const strokes = strokeMap.get(mark.index)
+    let composed = mark.screenshot
+    if (strokes && strokes.length > 0) {
+      const result = await composeScreenshot(mark.screenshot, strokes)
+      if (result === null) {
+        console.error('[dsh-point] compose screenshot failed, sending original screenshot')
+      } else {
+        composed = result
+      }
+      strokeMap.delete(mark.index)
+    }
+    deps.sendMark({ ...mark, screenshot: composed }, comment).then(
+      () => {
+        popupBusy = false
+        deps.updateMark(mark.index, { status: 'sent', comment, screenshot: composed })
+        deps.openMark(null)
+      },
+      (error: unknown) => {
+        popupBusy = false
+        renderPopup()
+        const reason = error instanceof Error ? error.message : String(error)
+        showToast(`发送失败：${reason}。请检查网络或会话状态后重试。`)
+      },
+    )
+  }
+
+  async function handleStage(mark: Mark, comment: string): Promise<void> {
+    const strokes = strokeMap.get(mark.index)
+    let composed = mark.screenshot
+    if (strokes && strokes.length > 0) {
+      const result = await composeScreenshot(mark.screenshot, strokes)
+      if (result === null) {
+        console.error('[dsh-point] compose screenshot failed, keeping original screenshot')
+      } else {
+        composed = result
+      }
+      strokeMap.delete(mark.index)
+    }
+    deps.updateMark(mark.index, { status: 'pending', comment, screenshot: composed })
+    deps.openMark(null)
+  }
+
+  /** Build the screenshot thumbnail + drawing canvas + toolbar for one popup. */
+  function renderDrawingLayer(container: HTMLElement, mark: Mark): { wrapper: HTMLElement } {
+    const wrapper = document.createElement('div')
+    wrapper.className = 'dsh-point-drawing'
+
+    const img = document.createElement('img')
+    img.className = 'dsh-point-drawing-img'
+    img.src = mark.screenshot
+    img.alt = '所指截图'
+
+    const canvas = document.createElement('canvas')
+    canvas.className = 'dsh-point-drawing-canvas'
+    drawingCanvas = canvas
+
+    const toolbar = document.createElement('div')
+    toolbar.className = 'dsh-point-drawing-toolbar'
+
+    const makeTool = (tool: DrawTool, label: string) => {
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.textContent = label
+      btn.dataset.tool = tool
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation()
+        currentTool = currentTool === tool ? null : tool
+        activeStroke = null
+        renderPopup()
+      })
+      return btn
+    }
+    const penBtn = makeTool('pen', '画笔')
+    const arrowBtn = makeTool('arrow', '箭头')
+    const rectBtn = makeTool('rect', '矩形')
+    const undoBtn = document.createElement('button')
+    undoBtn.type = 'button'
+    undoBtn.textContent = '撤销'
+    undoBtn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const strokes = strokeMap.get(mark.index)
+      if (strokes) {
+        strokes.pop()
+        redrawCanvas(mark)
+      }
+    })
+    const clearBtn = document.createElement('button')
+    clearBtn.type = 'button'
+    clearBtn.textContent = '清空'
+    clearBtn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      strokeMap.delete(mark.index)
+      redrawCanvas(mark)
+    })
+    toolbar.appendChild(penBtn)
+    toolbar.appendChild(arrowBtn)
+    toolbar.appendChild(rectBtn)
+    toolbar.appendChild(undoBtn)
+    toolbar.appendChild(clearBtn)
+
+    const activateToolStyle = () => {
+      for (const btn of [penBtn, arrowBtn, rectBtn]) {
+        btn.classList.toggle('active', btn.dataset.tool === currentTool)
+      }
+      canvas.style.pointerEvents = currentTool ? 'auto' : 'none'
+    }
+
+    img.onload = () => {
+      canvas.width = img.naturalWidth
+      canvas.height = img.naturalHeight
+      drawingCtx = canvas.getContext('2d')
+      redrawCanvas(mark)
+      activateToolStyle()
+    }
+    // If the image is already cached, onload may not fire; handle it directly.
+    if (img.complete && img.naturalWidth > 0) {
+      canvas.width = img.naturalWidth
+      canvas.height = img.naturalHeight
+      drawingCtx = canvas.getContext('2d')
+      redrawCanvas(mark)
+      activateToolStyle()
+    }
+
+    const toRatio = (e: MouseEvent): { x: number; y: number } => {
+      const rect = canvas.getBoundingClientRect()
+      const scaleX = canvas.width / rect.width
+      const scaleY = canvas.height / rect.height
+      return {
+        x: Math.min(1, Math.max(0, (e.clientX - rect.left) * scaleX / canvas.width)),
+        y: Math.min(1, Math.max(0, (e.clientY - rect.top) * scaleY / canvas.height)),
+      }
+    }
+
+    canvas.addEventListener('mousedown', (e) => {
+      if (!currentTool) return
+      e.preventDefault()
+      const { x, y } = toRatio(e)
+      activeStroke = { tool: currentTool, points: [x, y] }
+    })
+
+    canvas.addEventListener('mousemove', (e) => {
+      if (!currentTool || !activeStroke) return
+      e.preventDefault()
+      const { x, y } = toRatio(e)
+      if (currentTool === 'pen') {
+        activeStroke.points.push(x, y)
+        redrawCanvas(mark)
+        return
+      }
+      // arrow / rect: keep the live preview as the last point pair.
+      activeStroke.points = [activeStroke.points[0], activeStroke.points[1], x, y]
+      redrawCanvas(mark, activeStroke)
+    })
+
+    const endStroke = () => {
+      if (!currentTool || !activeStroke) return
+      if (activeStroke.points.length >= 4) {
+        const strokes = strokeMap.get(mark.index) ?? []
+        strokes.push(activeStroke)
+        strokeMap.set(mark.index, strokes)
+      }
+      activeStroke = null
+      redrawCanvas(mark)
+    }
+    canvas.addEventListener('mouseup', endStroke)
+    canvas.addEventListener('mouseleave', endStroke)
+
+    wrapper.appendChild(img)
+    wrapper.appendChild(canvas)
+    wrapper.appendChild(toolbar)
+    return { wrapper }
+  }
+
+  function redrawCanvas(mark: Mark, preview?: Stroke | null): void {
+    if (!drawingCanvas || !drawingCtx) return
+    drawingCtx.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height)
+    const strokes = strokeMap.get(mark.index) ?? []
+    drawStrokes(drawingCtx, preview ? [...strokes, preview] : strokes, drawingCanvas.width, drawingCanvas.height)
   }
 
   function repositionPopup(): void {
@@ -1075,6 +1304,14 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
 
   function onKeyDown(e: KeyboardEvent): void {
     if (e.repeat || e.key !== 'Escape' || !state.marking) return
+    // 2026-08-24: Esc 层级：工具态 > 拖拽态 > 标记态。
+    // 工具态下只退出工具，不退出标记模式，也不关闭 popup。
+    if (currentTool !== null && state.activeIndex !== null) {
+      currentTool = null
+      activeStroke = null
+      renderPopup()
+      return
+    }
     if (dragState !== null) {
       dragState = null
       removeDragRect()
@@ -1184,12 +1421,25 @@ export function createMarkingController(deps: MarkingControllerDeps): MarkingCon
       renderBadges()
     }
     if (activeChanged || marksChanged) {
+      // 2026-08-24: switching marks resets the drawing tool so stale tools do
+      // not surprise the user on the next popup.
+      currentTool = null
+      activeStroke = null
+      drawingCanvas = null
+      drawingCtx = null
+      drawingImg = null
       renderPopup()
     }
     repositionPopup()
   }
 
-  return { mount, dispose, sync }
+  function consumeStrokes(index: number): Stroke[] | undefined {
+    const strokes = strokeMap.get(index)
+    if (strokes) strokeMap.delete(index)
+    return strokes
+  }
+
+  return { mount, dispose, sync, consumeStrokes }
 }
 
 /* ---------- injected styles ---------- */
@@ -1342,6 +1592,49 @@ body.dsh-point-marking .dsh-point-cross { cursor: pointer; }
   background: rgba(37, 99, 235, 0.04);
   pointer-events: none;
   z-index: 2147482999;
+}
+/* 2026-08-24: 评论窗白板绘制层 */
+.dsh-point-drawing {
+  position: relative;
+  margin: 10px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #f9fafb;
+}
+.dsh-point-drawing-img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.dsh-point-drawing-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.dsh-point-drawing-toolbar {
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  background: #ffffff;
+  border-top: 1px solid #e5e7eb;
+}
+.dsh-point-drawing-toolbar button {
+  flex: 1;
+  padding: 4px 6px;
+  font-size: 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #ffffff;
+  cursor: pointer;
+}
+.dsh-point-drawing-toolbar button.active {
+  background: #ff2d55;
+  border-color: #ff2d55;
+  color: #ffffff;
 }
 `
   document.head.appendChild(style)

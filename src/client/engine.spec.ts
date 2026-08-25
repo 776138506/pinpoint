@@ -253,3 +253,172 @@ describe('engine 区域框选', () => {
     expect((border as HTMLElement).style.height).toBe('40px')
   })
 })
+
+describe('engine 框选坐标换算（2026-08-25：滚动漂移 / 超界钳制）', () => {
+  // jsdom 不实现真实滚动/文档尺寸，用 defineProperty 桩；测完复位 0 防串用例
+  function stubScroll(x: number, y: number): void {
+    Object.defineProperty(window, 'scrollX', { configurable: true, get: () => x })
+    Object.defineProperty(window, 'scrollY', { configurable: true, get: () => y })
+  }
+  function stubDocSize(w: number, h: number): void {
+    Object.defineProperty(document.documentElement, 'scrollWidth', { configurable: true, get: () => w })
+    Object.defineProperty(document.documentElement, 'scrollHeight', { configurable: true, get: () => h })
+  }
+  afterEach(() => { stubScroll(0, 0); stubDocSize(0, 0) })
+
+  it('拖拽中页面滚动：起点用滚动快照换算，区域边界不随页面漂移', async () => {
+    const deps = setup()
+    await makeController(deps)
+    const target = document.createElement('div')
+    document.body.appendChild(target)
+
+    stubScroll(0, 0)
+    target.dispatchEvent(new MouseEvent('mousedown', { clientX: 10, clientY: 20, bubbles: true }))
+    // 拖拽中用户滚动了 500px——终点的文档坐标必须按当前滚动换算
+    stubScroll(0, 500)
+    target.dispatchEvent(new MouseEvent('mousemove', { clientX: 60, clientY: 120, bubbles: true }))
+    target.dispatchEvent(new MouseEvent('mouseup', { clientX: 60, clientY: 120, bubbles: true }))
+    await flushAsync()
+
+    expect(deps.addMark).toHaveBeenCalledTimes(1)
+    const mark = deps.addMark.mock.calls[0]![0] as { selector: string }
+    // 起点文档 y = 20 + 0；终点文档 y = 120 + 500 = 620 → 高 600
+    expect(mark.selector).toBe('region:10,20,50,600')
+  })
+
+  it('框选超出文档范围：钳制到文档边界并传给截图正确的窗口尺寸', async () => {
+    const deps = setup()
+    await makeController(deps)
+    stubDocSize(800, 600)
+    const target = document.createElement('div')
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 10, clientY: 10 },
+      { type: 'mousemove', clientX: 1000, clientY: 1000 },
+      { type: 'mouseup', clientX: 1000, clientY: 1000 },
+    ])
+    await flushAsync()
+
+    expect(deps.addMark).toHaveBeenCalledTimes(1)
+    const mark = deps.addMark.mock.calls[0]![0] as { selector: string }
+    expect(mark.selector).toBe('region:10,10,790,590')
+    const html2canvas = (await import('html2canvas')).default as ReturnType<typeof vi.fn>
+    const opts = html2canvas.mock.calls.at(-1)?.[1] as Record<string, unknown>
+    expect(opts.windowWidth).toBe(800)
+    expect(opts.windowHeight).toBe(600)
+  })
+
+  it('完全拖出文档范围：不产出 mark', async () => {
+    const deps = setup()
+    await makeController(deps)
+    stubDocSize(100, 100)
+    const target = document.createElement('div')
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 200, clientY: 200 },
+      { type: 'mousemove', clientX: 300, clientY: 300 },
+      { type: 'mouseup', clientX: 300, clientY: 300 },
+    ])
+    await flushAsync()
+
+    expect(deps.addMark).not.toHaveBeenCalled()
+  })
+})
+
+describe('engine 评论窗绘画层（2026-08-24）', () => {
+  it('有截图的草稿标记弹出绘画工具栏与画布', async () => {
+    const deps = setup()
+    const controller = await makeController(deps)
+    controller.sync({
+      marking: true,
+      marks: [{
+        index: 1,
+        selector: '#target',
+        text: 'target',
+        html: '<div id="target">target</div>',
+        source: '页面',
+        sourceUrl: 'https://example.com',
+        sourceTitle: 'Example',
+        frameKind: 'main',
+        screenshot: FAKE_SCREENSHOT,
+        hasExternalImage: false,
+        time: '2026-08-24T00:00:00Z',
+        status: 'draft',
+      }],
+      nextIndex: 2,
+      activeIndex: 1,
+    })
+    await flushAsync()
+
+    expect(document.querySelector('.dsh-point-drawing')).not.toBeNull()
+    expect(document.querySelector('.dsh-point-drawing-canvas')).not.toBeNull()
+    const buttons = document.querySelectorAll('.dsh-point-drawing-toolbar button')
+    expect(buttons.length).toBe(5)
+    expect(Array.from(buttons).map(b => b.textContent)).toEqual(['画笔', '箭头', '矩形', '撤销', '清空'])
+  })
+
+  it('已发送标记不渲染绘画层', async () => {
+    const deps = setup()
+    const controller = await makeController(deps)
+    controller.sync({
+      marking: true,
+      marks: [{
+        index: 1,
+        selector: '#target',
+        text: 'target',
+        html: '<div id="target">target</div>',
+        source: '页面',
+        sourceUrl: 'https://example.com',
+        sourceTitle: 'Example',
+        frameKind: 'main',
+        screenshot: FAKE_SCREENSHOT,
+        hasExternalImage: false,
+        time: '2026-08-24T00:00:00Z',
+        status: 'sent',
+      }],
+      nextIndex: 2,
+      activeIndex: 1,
+    })
+    await flushAsync()
+
+    expect(document.querySelector('.dsh-point-drawing')).toBeNull()
+  })
+
+  it('Esc 层级：工具态下只退出工具，不退出标记模式', async () => {
+    const deps = setup()
+    const controller = await makeController(deps)
+    controller.sync({
+      marking: true,
+      marks: [{
+        index: 1,
+        selector: '#target',
+        text: 'target',
+        html: '<div id="target">target</div>',
+        source: '页面',
+        sourceUrl: 'https://example.com',
+        sourceTitle: 'Example',
+        frameKind: 'main',
+        screenshot: FAKE_SCREENSHOT,
+        hasExternalImage: false,
+        time: '2026-08-24T00:00:00Z',
+        status: 'draft',
+      }],
+      nextIndex: 2,
+      activeIndex: 1,
+    })
+    await flushAsync()
+
+    const penBtn = document.querySelector<HTMLButtonElement>('.dsh-point-drawing-toolbar button[data-tool="pen"]')!
+    penBtn.click()
+    await flushAsync()
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flushAsync()
+
+    expect(deps.setMarking).not.toHaveBeenCalled()
+    // 退出工具后重新渲染，画布应仍然存在。
+    expect(document.querySelector('.dsh-point-drawing-canvas')).not.toBeNull()
+  })
+})

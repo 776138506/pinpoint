@@ -14,8 +14,10 @@
 import { createMarkingStore } from './stores.ts'
 import { MarkButton } from './MarkButton.tsx'
 import { MarkingEngine } from './MarkingEngine.tsx'
+import type { MarkingEngineApi } from './MarkingEngine.tsx'
 import { PointDock } from './PointDock.tsx'
 import { dataUrlToFile, formatMarkText } from './util.ts'
+import { composeScreenshot } from './drawing.ts'
 import { mountReferentCardEnhancer } from './referent-card.ts'
 import type { Mark } from './stores.ts'
 
@@ -63,6 +65,25 @@ function imageIdsFromMark(conversation: ConversationFace, mark: Mark): readonly 
   return conversation.createDraftImages([file]).map(a => a.id)
 }
 
+const strokeApis = new Map<string, MarkingEngineApi>()
+
+/**
+ * 2026-08-24: consume the whiteboard strokes for a mark and compose them onto the
+ * screenshot before sending. If composition fails, fall back to the original
+ * screenshot so the send is not blocked.
+ */
+async function composeMark(sessionId: string, mark: Mark): Promise<Mark> {
+  const api = strokeApis.get(sessionId)
+  const strokes = api?.consumeStrokes(mark.index)
+  if (!strokes || strokes.length === 0) return mark
+  const result = await composeScreenshot(mark.screenshot, strokes)
+  if (result === null) {
+    console.error('[dsh-point] compose screenshot failed, sending original screenshot')
+    return mark
+  }
+  return { ...mark, screenshot: result }
+}
+
 /**
  * Client plugin body.
  * @param ctx - client root context.
@@ -90,6 +111,9 @@ export function apply(ctx: Ctx): void {
           const text = formatMarkText(mark, comment)
           await conversation.sendSession(session, text, ids, 'queue')
         },
+        onReady: (sessionId: string, api: MarkingEngineApi) => {
+          strokeApis.set(sessionId, api)
+        },
       }),
     }, MarkingEngine)
   })
@@ -103,29 +127,32 @@ export function apply(ctx: Ctx): void {
       inject: (sessionId: string) => ({
         sendMark: async (mark: Mark, comment: string) => {
           const { session, conversation } = scopeChecked(ctx, sessionId)
-          const ids = imageIdsFromMark(conversation, mark)
-          const text = formatMarkText(mark, comment)
+          const prepared = await composeMark(sessionId, mark)
+          const ids = imageIdsFromMark(conversation, prepared)
+          const text = formatMarkText(prepared, comment)
           await conversation.sendSession(session, text, ids, 'queue')
         },
         sendAll: async (marks: readonly Mark[]) => {
           const { session, conversation } = scopeChecked(ctx, sessionId)
+          const prepared = await Promise.all(marks.map(m => composeMark(sessionId, m)))
           const ids: string[] = []
           const parts: string[] = []
-          for (const mark of marks) {
+          for (const mark of prepared) {
             ids.push(...imageIdsFromMark(conversation, mark))
             parts.push(formatMarkText(mark, mark.comment ?? ''))
           }
           const text = parts.join('\n\n')
           await conversation.sendSession(session, text, ids, 'queue')
         },
-        editInComposer: (mark: Mark, comment: string) => {
+        editInComposer: async (mark: Mark, comment: string) => {
           const { actx, conversation } = scopeChecked(ctx, sessionId)
           const input = conversation.input.for(actx)
-          const ids = imageIdsFromMark(conversation, mark)
+          const prepared = await composeMark(sessionId, mark)
+          const ids = imageIdsFromMark(conversation, prepared)
           // 2026-08-24: write the text first, then the images. The old order
           // (images → setDraft) left dangling images in the composer when
           // setDraft threw after addImages had already succeeded.
-          input.setDraft(formatMarkText(mark, comment))
+          input.setDraft(formatMarkText(prepared, comment))
           if (ids.length > 0 && !input.addImages(ids)) {
             throw new Error('文字已写入输入框，但截图插入失败（输入框正忙）。请稍后重试「回输入框」以补上截图。')
           }

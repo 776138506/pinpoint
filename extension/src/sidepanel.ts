@@ -41,6 +41,31 @@ function itemKey(i: { tabId?: number; index: number }): string {
   return `${i.tabId ?? 'legacy'}:${i.index}`
 }
 
+// 2026-08-24: 侧栏关闭再打开后恢复待发列表。panelOutbox 保存在 chrome.storage.session
+//（MV3 side panel 文档销毁后内存丢失，SW 的 stagedQueue 只缓冲侧栏关闭期间到达的标记）。
+// ponytail: 截图 dataURL 可能很大，chrome.storage.session 配额约 10MB，写入超限只记日志不崩。
+const PANEL_OUTBOX_KEY = 'panelOutbox'
+let persistOutboxDirty = false
+let persistOutboxFlushing = false
+function schedulePersistOutbox(): void {
+  persistOutboxDirty = true
+  if (persistOutboxFlushing) return
+  persistOutboxFlushing = true
+  Promise.resolve().then(async () => {
+    try {
+      if (persistOutboxDirty) {
+        await chrome.storage.session.set({ [PANEL_OUTBOX_KEY]: state.outbox })
+        persistOutboxDirty = false
+      }
+    } catch (e) {
+      console.error('[dsh-point-ext] persist panel outbox failed (quota?):', e)
+    } finally {
+      persistOutboxFlushing = false
+      if (persistOutboxDirty) schedulePersistOutbox()
+    }
+  })
+}
+
 // 2026-08-24: port 断线自动重连（复归整改）。MV3 SW 空闲即死、port 随之断开；
 // 面板作后台 tab 时健康轮询被 Chrome 节流，撞死 port 后点击按钮静默无反应。
 let port: chrome.runtime.Port | null = null
@@ -84,6 +109,7 @@ function connectPort(): void {
         item.error = '连接中断，发送结果未知，请确认会话后重试'
       }
     }
+    schedulePersistOutbox()
     updateUi()
     setTimeout(connectAndResync, 1000)
   })
@@ -260,6 +286,7 @@ function toggleEditor(row: HTMLDivElement, item: OutboxItem): void {
     item.mark.comment = ta.value.trim()
     // 同步页面侧评论窗内容（best-effort：页面可能已关闭/导航）
     void sendToTab(item.tabId, { type: 'UPDATE_MARK', index: item.mark.index, patch: { comment: item.mark.comment } })
+    schedulePersistOutbox()
     updateUi()
   })
   const cancelBtn = document.createElement('button')
@@ -288,6 +315,7 @@ function sendItem(item: OutboxItem): void {
   if (!sessionId) {
     item.status = 'error'
     item.error = '未选择目标会话'
+    schedulePersistOutbox()
     updateUi()
     return
   }
@@ -307,6 +335,7 @@ function sendItem(item: OutboxItem): void {
 
 function removeItem(item: OutboxItem): void {
   state.outbox = state.outbox.filter(i => i !== item)
+  schedulePersistOutbox()
   updateUi()
   // 2026-08-21: 删除时向标记来源页（而非活动页）发 REMOVE_MARK，避免跨 tab 残留高亮
   void sendToTab(item.tabId, { type: 'REMOVE_MARK', index: item.mark.index })
@@ -364,6 +393,7 @@ clearAllBtn.addEventListener('click', async () => {
   const tabIds = new Set<number>()
   for (const i of state.outbox) if (typeof i.tabId === 'number') tabIds.add(i.tabId)
   state.outbox = []
+  schedulePersistOutbox()
   updateUi()
   if (tabIds.size === 0) {
     await sendToTab(undefined, { type: 'CLEAR_MARKS' })
@@ -432,6 +462,7 @@ function onPortMessage(message: any): void {
         const item = state.outbox.find(i => itemKey({ tabId: i.tabId, index: i.mark.index }) === itemKey({ tabId, index: m.index }))
         if (item) sendItem(item)
       }
+      schedulePersistOutbox()
       updateUi()
       break
     }
@@ -452,6 +483,7 @@ function onPortMessage(message: any): void {
         index: message.markIndex,
         patch: { status: message.ok ? 'sent' : 'error' },
       })
+      schedulePersistOutbox()
       updateUi()
       break
     }
@@ -477,6 +509,28 @@ function restartHealthPoll(): void {
   }, extSettings.healthPollMs)
 }
 
+// 2026-08-24: 初始化时从 session storage 恢复待发列表，恢复后再渲染。
+void chrome.storage.session.get(PANEL_OUTBOX_KEY).then((data) => {
+  const saved = data[PANEL_OUTBOX_KEY]
+  if (Array.isArray(saved)) {
+    state.outbox = saved.map((i: unknown) => {
+      const item = i as Partial<OutboxItem>
+      if (!item || !item.mark || typeof item.mark.index !== 'number') return null
+      return {
+        mark: item.mark as Mark,
+        status: item.status ?? 'pending',
+        error: item.error,
+        downgraded: item.downgraded,
+        tabId: item.tabId,
+      } as OutboxItem
+    }).filter((i): i is OutboxItem => i !== null)
+  }
+}).catch((e) => {
+  console.error('[dsh-point-ext] restore panel outbox failed:', e)
+}).finally(() => {
+  updateUi()
+})
+
 // 2026-08-21: 设置已统一迁入扩展选项页（options.html），此处仅消费 settings 变更
 // Initial load.
 void loadSettings().then((s) => {
@@ -493,4 +547,3 @@ onSettingsChanged((s) => {
 })
 safePost({ type: 'HEALTH_CHECK' })
 safePost({ type: 'LIST_SESSIONS' })
-updateUi()

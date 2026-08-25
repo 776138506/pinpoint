@@ -8,8 +8,14 @@
 import { useEffect, useRef } from 'react'
 import { createMarkingController } from './engine.ts'
 import type { MarkingControllerDeps } from './engine.ts'
+import type { Stroke } from './drawing.ts'
 import type { Mark, MarkingActions, MarkingState } from './stores.ts'
 import type { MarkingUseStore } from './MarkButton.tsx'
+
+/** Engine API exposed to the host so it can consume whiteboard strokes before sending. */
+export interface MarkingEngineApi {
+  consumeStrokes(index: number): Stroke[] | undefined
+}
 
 /** Props for the engine (PropsStore share + session standard kit + send callback). */
 export interface MarkingEngineProps {
@@ -17,6 +23,8 @@ export interface MarkingEngineProps {
   useStore: MarkingUseStore
   actions: MarkingActions
   sendMark(mark: Mark, comment: string): Promise<void>
+  /** Called once after the imperative controller is created. */
+  onReady?(sessionId: string, api: MarkingEngineApi): void
 }
 
 /**
@@ -25,8 +33,9 @@ export interface MarkingEngineProps {
  * @param props.useStore - marking store selector hook.
  * @param props.actions - marking store write set.
  * @param props.sendMark - send one mark + comment to the current session.
+ * @param props.onReady - optional callback to expose strokes API to the host.
  */
-export function MarkingEngine({ sessionId, useStore, actions, sendMark }: MarkingEngineProps): null {
+export function MarkingEngine({ sessionId, useStore, actions, sendMark, onReady }: MarkingEngineProps): null {
   const marking = useStore(s => s.marking)
   const marks = useStore(s => s.marks)
   const nextIndex = useStore(s => s.nextIndex)
@@ -61,6 +70,13 @@ export function MarkingEngine({ sessionId, useStore, actions, sendMark }: Markin
   useEffect(() => {
     ctrlRef.current?.sync({ marking, marks, nextIndex, activeIndex })
   }, [marking, marks, nextIndex, activeIndex])
+
+  useEffect(() => {
+    if (!onReady) return
+    onReady(sessionId, {
+      consumeStrokes: (index) => ctrlRef.current?.consumeStrokes(index) ?? undefined,
+    })
+  }, [sessionId, onReady])
 
   return null
 }

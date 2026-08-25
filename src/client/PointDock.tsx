@@ -12,7 +12,7 @@ import type { MarkingUseStore } from './MarkButton.tsx'
 interface PointDockInjected {
   sendMark(mark: Mark, comment: string): Promise<void>
   sendAll(marks: readonly Mark[]): Promise<void>
-  editInComposer(mark: Mark, comment: string): void
+  editInComposer(mark: Mark, comment: string): Promise<void>
 }
 
 /** Props for the footer entry: store share + session standard kit + injected callbacks. */
@@ -157,9 +157,9 @@ export function PointDock({ useStore, actions, sendMark, sendAll, editInComposer
         createElement('div', { key: mark.index, style: rowStyle },
           createElement('span', { style: previewStyle }, `#${mark.index} ${mark.source}：${mark.comment || mark.text || '（无备注）'}`),
           btn('发送', () => { void sendSingle(mark) }, busyAll || busyOne !== null),
-          btn('回输入框', () => {
+          btn('回输入框', async () => {
             try {
-              editInComposer(mark, mark.comment ?? '')
+              await editInComposer(mark, mark.comment ?? '')
               actions.updateMark(mark.index, { status: 'draft' })
             } catch (error: unknown) {
               const reason = error instanceof Error ? error.message : String(error)

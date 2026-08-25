@@ -22,6 +22,36 @@
 - （无）
 
 ## 变更日志（纯增量，唯一的历史通道）
+### 2026-08-24 ｜ 侧栏暂存区持久化修复（关窗不丢暂存）
+- 根因：侧栏打开期间收到的 STAGE_MARK 只进 sidepanel 内存 state.outbox；side panel 文档一关即销毁，background 的 stagedQueue 只缓冲「侧栏关闭期间」到达的标记——已送达侧栏的标记无人留副本，重开即空
+- 变更：sidepanel.ts 新增 panelOutbox 写穿到 chrome.storage.session（微任务合批防抖），初始化时恢复并渲染；background 冲刷缓冲项与 panelOutbox 按 (tabId,index) 去重以新到为准；outbox 每次变更（入列/状态/删除/清空/编辑评论）都触发写穿
+- 验证：sidepanel.spec.ts 新增 2 例（重开恢复 / 冲刷去重）；117/117 绿
+- 已知项：截图 dataURL 大时可能超 session 配额（10MB），写入失败只记日志不崩（ponytail 已注）
+
+### 2026-08-25 ｜ 框选坐标三 bug 修复（滚动漂移/显示不符/超界）
+- 根因与修复（engine.ts 与 extension/content.ts 双侧同构）：
+  1. 拖拽中页面滚动 → 区域边界漂移：起点是 mousedown 时的客户区坐标，update/end 却用「旧客户区坐标 + 当前滚动」换算。改为两端点各自「客户区坐标 + 当时滚动快照」换算文档坐标
+  2. 框选显示与实际不符：选区矩形/常驻边框挂在 body 下，站点给 body 设 position:relative/margin 时 absolute 定位按 body 偏移。改挂 documentElement
+  3. 截图裁剪与框选不符：html2canvas 克隆渲染默认只铺视口大小，页面滚动后按文档坐标裁剪错位/空白。补 windowWidth/windowHeight = scrollWidth/scrollHeight（ponytail：克隆窗口变宽可能触发响应式媒体查询差异）
+  4. 顺带：框选钳制到文档范围 [0, scrollWidth]×[0, scrollHeight]，完全拖出范围不产出 mark
+- 测试：engine.spec.ts / content.spec.ts 各 +3 例（滚动漂移/钳制/完全出界），123/123 绿 + build 绿
+- 待实机验证：重载扩展后在横向滚动页/长页面框选核对显示与截图
+
+### 2026-08-24 ｜ 白板绘画标记（dsh 侧 + 扩展侧）
+- 变更：
+  - 新增 `src/client/drawing.ts`：纯函数绘画原语，定义 `DrawTool`（画笔/箭头/矩形）与 `Stroke`（比例坐标），提供 `getArrowHead`、`drawStrokes`、`composeScreenshot`。
+  - `src/client/engine.ts`：评论窗增加白板绘制层（截图 + canvas + 工具栏），支持画笔、箭头、矩形、撤销、清空；比例坐标存储 strokes；发送/暂存时合成到截图；删除/清空时清理 strokes；Esc 层级改为「工具态 > 拖拽态 > 标记态」；暴露 `consumeStrokes(index)` 给宿主。
+  - `src/client/MarkingEngine.tsx`：新增 `onReady(sessionId, api)` 回调，把 `consumeStrokes` 暴露给插件宿主。
+  - `src/client/index.ts`：按 `sessionId` 缓存 `MarkingEngineApi`；`sendMark`/`sendAll`/`editInComposer` 在发送前调用 `composeMark` 合成 strokes；`editInComposer` 改为异步。
+  - `src/client/PointDock.tsx`：「回输入框」按钮改为 `await editInComposer`，捕获图片插入失败。
+  - `extension/src/content.ts`：扩展评论窗同步增加绘画层与工具栏；发送/暂存前调用 `composeLocalMark` 合成 strokes；删除/清空时清理 strokes；Esc 层级对齐 dsh 侧（工具态 > 拖拽态 > 标记态）；新增 `.dsh-point-ext-drawing*` 样式。
+  - 新增 `src/client/drawing.spec.ts`（8 例）：覆盖箭头几何、比例→像素换算、绘制指令、合成成功/失败/短路。
+  - 扩展 `src/client/engine.spec.ts`（+3 例）与 `extension/src/content.spec.ts`（+3 例）：覆盖绘画层渲染、已发送不渲染、Esc 工具态、发送前合成截图。
+- 旧值：评论窗仅支持文字评论，截图原样发送；无标注/画笔/箭头/矩形能力；Esc 不识别工具态。
+- 原因：用户验收反馈——需要在截图上圈画重点后再发送，避免纯文字描述位置。
+- 验证：`npm test` = `tsc --noEmit && vitest run` 117/117 绿；`npm run build` 绿。
+- 已知项/教训：jsdom 无 canvas 2d 实现，drawing.spec 用 fake context + spy 验证绘制指令；content.spec 同文件残留 content 实例监听器未清理，Esc 相关断言只验证当前实例行为；扩展侧绘画 strokes 不持久化（刷新丢失），与 dsh 侧一致。
+
 ### 2026-08-24 ｜ 区域框选标记（engine + 扩展 content）
 - 变更：
   - `src/client/engine.ts` 增加区域框选：标记模式下 mousedown 开始拖拽，移动 >6px 时绘制选区矩形，mouseup 捕获为 `region:x,y,w,h` 标记；≤6px 视为点击继续走元素捕获；拖拽中 Esc 取消；新增 `.dsh-point-region-rect`/`.dsh-point-region-kept` 样式；`resolveMarkElement`/`markViewportRect`/`renderBadges`/`repositionBadges`/`repositionPopup` 覆盖 region 分支，支持持久边框与角标/弹窗定位。

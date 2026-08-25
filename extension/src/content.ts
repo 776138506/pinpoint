@@ -11,6 +11,8 @@
 import html2canvas from 'html2canvas'
 import { cloneForScreenshot, codeLocationFor, cssPath, detectExternalImages, documentRectOf, snippet, textFragmentFor, visibleText, xpathFor } from '../../src/client/mark-utils.ts'
 import { formatMarkText } from '../../src/client/util.ts'
+import { composeScreenshot, drawStrokes } from '../../src/client/drawing.ts'
+import type { DrawTool, Stroke } from '../../src/client/drawing.ts'
 import { BUILTIN_SHORTCUT, comboFromEvent } from './shortcut.ts'
 import { DEFAULT_SETTINGS, loadSettings, onSettingsChanged, type ExtSettings } from './settings.ts'
 import type { Mark, MarkStatus } from '../../src/client/stores.ts'
@@ -46,6 +48,10 @@ let captureInFlight = false
 // (if dragged) or falls through to the click handler (if not). Esc cancels drag.
 let dragStartX = 0
 let dragStartY = 0
+// 2026-08-25: mousedown 时的滚动快照——拖拽中页面滚动时，起点必须用「起点客户区
+// 坐标 + 起点滚动」换算文档坐标，否则区域边界随页面漂移
+let dragStartScrollX = 0
+let dragStartScrollY = 0
 let isDragging = false
 let dragRectEl: HTMLElement | null = null
 let suppressClick = false
@@ -53,6 +59,15 @@ let suppressClick = false
 // 2026-08-24: region marks have no DOM element, so we keep a persistent
 // border div per mark that follows scroll/resize via repositionAll().
 const regionEls = new Map<number, HTMLElement>()
+
+// 2026-08-24: per-mark whiteboard strokes stored as ratios relative to the
+// original screenshot. Deleted when the mark is removed; composed into the
+// screenshot at send/stage time. ponytail: not persisted (lost on refresh).
+const strokeMap = new Map<number, Stroke[]>()
+let currentTool: DrawTool | null = null
+let activeStroke: Stroke | null = null
+let drawingCanvas: HTMLCanvasElement | null = null
+let drawingCtx: CanvasRenderingContext2D | null = null
 
 // 2026-08-20: 页面内自定义快捷键（侧栏设置区配置，chrome.storage 共享）。
 // 等于内置 Alt+Shift+M 时不处理——该组合由 manifest commands 全局接管，避免双重切换
@@ -159,6 +174,32 @@ function onMouseOut(e: MouseEvent): void {
   if (el === hoveredEl) { unhighlight(el); hoveredEl = null }
 }
 
+/**
+ * 2026-08-25: 框选坐标统一换算——两端点各自用「客户区坐标 + 当时滚动」换成文档
+ * 坐标（拖拽中滚动也正确），再钳制到文档范围内。文档尺寸不可读（jsdom/异常页）
+ * 时不钳制。完全钳没（<2px）返回 null = 放弃本次框选。
+ */
+function regionRectFromDrag(e: MouseEvent): { x: number; y: number; width: number; height: number } | null {
+  const docStartX = dragStartX + dragStartScrollX
+  const docStartY = dragStartY + dragStartScrollY
+  const docCurX = e.clientX + window.scrollX
+  const docCurY = e.clientY + window.scrollY
+  const de = document.documentElement
+  const maxX = de.scrollWidth > 0 ? de.scrollWidth : Number.POSITIVE_INFINITY
+  const maxY = de.scrollHeight > 0 ? de.scrollHeight : Number.POSITIVE_INFINITY
+  const x1 = Math.max(0, Math.min(Math.min(docStartX, docCurX), maxX))
+  const y1 = Math.max(0, Math.min(Math.min(docStartY, docCurY), maxY))
+  const x2 = Math.max(0, Math.min(Math.max(docStartX, docCurX), maxX))
+  const y2 = Math.max(0, Math.min(Math.max(docStartY, docCurY), maxY))
+  if (x2 - x1 < 2 || y2 - y1 < 2) return null
+  return {
+    x: Math.round(x1),
+    y: Math.round(y1),
+    width: Math.round(x2 - x1),
+    height: Math.round(y2 - y1),
+  }
+}
+
 function onMouseDown(e: MouseEvent): void {
   if (!chrome.runtime?.id) return
   if (!state.marking) return
@@ -167,6 +208,8 @@ function onMouseDown(e: MouseEvent): void {
   if ((el as Element).closest(OWN_UI_SELECTOR)) return
   dragStartX = e.clientX
   dragStartY = e.clientY
+  dragStartScrollX = window.scrollX
+  dragStartScrollY = window.scrollY
   isDragging = true
 }
 
@@ -178,17 +221,22 @@ function onMouseMove(e: MouseEvent): void {
   if (Math.hypot(dx, dy) <= DRAG_THRESHOLD) return
   // 2026-08-24: 拖拽中阻止文本选择，避免页面内容被高亮。
   e.preventDefault()
+  const rect = regionRectFromDrag(e)
+  if (rect === null) {
+    if (dragRectEl !== null) { dragRectEl.remove(); dragRectEl = null }
+    return
+  }
   if (dragRectEl === null) {
     dragRectEl = document.createElement('div')
     dragRectEl.className = REGION_RECT_CLASS
-    document.body.appendChild(dragRectEl)
+    // 2026-08-25: 挂 documentElement 而非 body——站点给 body 设 position:relative/
+    // margin 时 absolute 相对 body 偏移，框选显示与实际不符
+    document.documentElement.appendChild(dragRectEl)
   }
-  const left = Math.min(dragStartX, e.clientX) + window.scrollX
-  const top = Math.min(dragStartY, e.clientY) + window.scrollY
-  dragRectEl.style.left = `${left}px`
-  dragRectEl.style.top = `${top}px`
-  dragRectEl.style.width = `${Math.abs(dx)}px`
-  dragRectEl.style.height = `${Math.abs(dy)}px`
+  dragRectEl.style.left = `${rect.x}px`
+  dragRectEl.style.top = `${rect.y}px`
+  dragRectEl.style.width = `${rect.width}px`
+  dragRectEl.style.height = `${rect.height}px`
 }
 
 function onMouseUp(e: MouseEvent): void {
@@ -201,15 +249,8 @@ function onMouseUp(e: MouseEvent): void {
   isDragging = false
   if (dragged) {
     suppressClick = true
-    const left = Math.min(dragStartX, e.clientX) + window.scrollX
-    const top = Math.min(dragStartY, e.clientY) + window.scrollY
-    const rect = {
-      x: Math.round(left),
-      y: Math.round(top),
-      width: Math.round(Math.abs(dx)),
-      height: Math.round(Math.abs(dy)),
-    }
-    void captureRegion(rect)
+    const rect = regionRectFromDrag(e)
+    if (rect !== null) void captureRegion(rect)
   }
 }
 
@@ -243,6 +284,14 @@ function onKeyDown(e: KeyboardEvent): void {
   if (!chrome.runtime?.id) return // 同上：失效旧实例静默
   if (e.repeat) return // 2026-08-24: 长按 repeat 会反复 toggle 标记态，只认第一次
   if (e.key === 'Escape' && state.marking) {
+    // 2026-08-24: Esc 层级：工具态 > 拖拽态 > 标记态。
+    // 工具态下只退出工具，不退出标记模式，也不关闭 popup。
+    if (currentTool !== null && state.activeIndex !== null) {
+      currentTool = null
+      activeStroke = null
+      renderPopup()
+      return
+    }
     if (isDragging) {
       isDragging = false
       if (dragRectEl !== null) { dragRectEl.remove(); dragRectEl = null }
@@ -390,6 +439,7 @@ async function captureRegionInner(rect: { x: number; y: number; width: number; h
   }
 
   try {
+    const de = document.documentElement
     const canvas = await Promise.race([
       html2canvas(document.documentElement, {
         backgroundColor: '#ffffff',
@@ -401,6 +451,11 @@ async function captureRegionInner(rect: { x: number; y: number; width: number; h
         y: rect.y,
         width: rect.width,
         height: rect.height,
+        // 2026-08-25: html2canvas 克隆渲染默认只铺视口大小，页面滚动后按文档坐标
+        // 裁剪会错位/空白；撑到整文档尺寸。ponytail: 克隆窗口变宽可能触发响应式
+        // 媒体查询差异，可接受
+        windowWidth: de.scrollWidth > 0 ? de.scrollWidth : undefined,
+        windowHeight: de.scrollHeight > 0 ? de.scrollHeight : undefined,
       }),
       new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`截图超时（${extSettings.screenshotTimeoutMs}ms）`)), extSettings.screenshotTimeoutMs)),
     ])
@@ -475,6 +530,7 @@ function releaseElement(mark: Mark): void {
 function removeMark(index: number): void {
   const mark = state.marks.find(m => m.index === index)
   if (mark) releaseElement(mark)
+  strokeMap.delete(index)
   setState({
     ...state,
     marks: state.marks.filter(m => m.index !== index),
@@ -491,6 +547,7 @@ function updateMark(index: number, patch: Partial<Omit<Mark, 'index'>>): void {
 
 function clearMarks(): void {
   for (const mark of state.marks) releaseElement(mark)
+  for (const index of strokeMap.keys()) strokeMap.delete(index)
   setState({ ...state, marks: [], activeIndex: null, nextIndex: 1 })
 }
 
@@ -544,7 +601,9 @@ function renderBadges(): void {
         border = document.createElement('div')
         border.className = REGION_KEPT_CLASS
         border.dataset.index = String(mark.index)
-        document.body.appendChild(border)
+        // 2026-08-25: 挂 documentElement——body 被站点设为 relative 时 absolute
+        // 定位按 body 偏移，区域边框与框选位置不符
+        document.documentElement.appendChild(border)
         regionEls.set(mark.index, border)
       }
       border.style.left = `${regionRect.x}px`
@@ -665,6 +724,157 @@ function findMarkedAncestor(el: Element): Element | null {
   return null
 }
 
+/* ---------- popup drawing layer ---------- */
+
+// 2026-08-24: screenshot whiteboard for the extension popup.
+function renderDrawingLayer(container: HTMLElement, mark: Mark): { wrapper: HTMLElement } {
+  const wrapper = document.createElement('div')
+  wrapper.className = 'dsh-point-ext-drawing'
+
+  const img = document.createElement('img')
+  img.className = 'dsh-point-ext-drawing-img'
+  img.src = mark.screenshot
+  img.alt = '所指截图'
+
+  const canvas = document.createElement('canvas')
+  canvas.className = 'dsh-point-ext-drawing-canvas'
+  drawingCanvas = canvas
+
+  const toolbar = document.createElement('div')
+  toolbar.className = 'dsh-point-ext-drawing-toolbar'
+
+  const makeTool = (tool: DrawTool, label: string) => {
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.textContent = label
+    btn.dataset.tool = tool
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      currentTool = currentTool === tool ? null : tool
+      activeStroke = null
+      renderPopup()
+    })
+    return btn
+  }
+  const penBtn = makeTool('pen', '画笔')
+  const arrowBtn = makeTool('arrow', '箭头')
+  const rectBtn = makeTool('rect', '矩形')
+  const undoBtn = document.createElement('button')
+  undoBtn.type = 'button'
+  undoBtn.textContent = '撤销'
+  undoBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    const strokes = strokeMap.get(mark.index)
+    if (strokes) {
+      strokes.pop()
+      redrawCanvas(mark)
+    }
+  })
+  const clearBtn = document.createElement('button')
+  clearBtn.type = 'button'
+  clearBtn.textContent = '清空'
+  clearBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    strokeMap.delete(mark.index)
+    redrawCanvas(mark)
+  })
+  toolbar.appendChild(penBtn)
+  toolbar.appendChild(arrowBtn)
+  toolbar.appendChild(rectBtn)
+  toolbar.appendChild(undoBtn)
+  toolbar.appendChild(clearBtn)
+
+  const activateToolStyle = () => {
+    for (const btn of [penBtn, arrowBtn, rectBtn]) {
+      btn.classList.toggle('active', btn.dataset.tool === currentTool)
+    }
+    canvas.style.pointerEvents = currentTool ? 'auto' : 'none'
+  }
+
+  img.onload = () => {
+    canvas.width = img.naturalWidth
+    canvas.height = img.naturalHeight
+    drawingCtx = canvas.getContext('2d')
+    redrawCanvas(mark)
+    activateToolStyle()
+  }
+  if (img.complete && img.naturalWidth > 0) {
+    canvas.width = img.naturalWidth
+    canvas.height = img.naturalHeight
+    drawingCtx = canvas.getContext('2d')
+    redrawCanvas(mark)
+    activateToolStyle()
+  }
+
+  const toRatio = (e: MouseEvent): { x: number; y: number } => {
+    const rect = canvas.getBoundingClientRect()
+    const scaleX = canvas.width / rect.width
+    const scaleY = canvas.height / rect.height
+    return {
+      x: Math.min(1, Math.max(0, (e.clientX - rect.left) * scaleX / canvas.width)),
+      y: Math.min(1, Math.max(0, (e.clientY - rect.top) * scaleY / canvas.height)),
+    }
+  }
+
+  canvas.addEventListener('mousedown', (e) => {
+    if (!currentTool) return
+    e.preventDefault()
+    const { x, y } = toRatio(e)
+    activeStroke = { tool: currentTool, points: [x, y] }
+  })
+
+  canvas.addEventListener('mousemove', (e) => {
+    if (!currentTool || !activeStroke) return
+    e.preventDefault()
+    const { x, y } = toRatio(e)
+    if (currentTool === 'pen') {
+      activeStroke.points.push(x, y)
+      redrawCanvas(mark)
+      return
+    }
+    activeStroke.points = [activeStroke.points[0], activeStroke.points[1], x, y]
+    redrawCanvas(mark, activeStroke)
+  })
+
+  const endStroke = () => {
+    if (!currentTool || !activeStroke) return
+    if (activeStroke.points.length >= 4) {
+      const strokes = strokeMap.get(mark.index) ?? []
+      strokes.push(activeStroke)
+      strokeMap.set(mark.index, strokes)
+    }
+    activeStroke = null
+    redrawCanvas(mark)
+  }
+  canvas.addEventListener('mouseup', endStroke)
+  canvas.addEventListener('mouseleave', endStroke)
+
+  wrapper.appendChild(img)
+  wrapper.appendChild(canvas)
+  wrapper.appendChild(toolbar)
+  return { wrapper }
+}
+
+function redrawCanvas(mark: Mark, preview?: Stroke | null): void {
+  if (!drawingCanvas || !drawingCtx) return
+  drawingCtx.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height)
+  const strokes = strokeMap.get(mark.index) ?? []
+  drawStrokes(drawingCtx, preview ? [...strokes, preview] : strokes, drawingCanvas.width, drawingCanvas.height)
+}
+
+// 2026-08-24: compose whiteboard strokes onto the screenshot before staging/sending.
+async function composeLocalMark(mark: Mark): Promise<Mark> {
+  const strokes = strokeMap.get(mark.index)
+  if (!strokes || strokes.length === 0) return mark
+  const result = await composeScreenshot(mark.screenshot, strokes)
+  if (result === null) {
+    console.error('[dsh-point-ext] compose screenshot failed, staging original screenshot')
+    return mark
+  }
+  strokeMap.delete(mark.index)
+  return { ...mark, screenshot: result }
+}
+
 /* ---------- popup ---------- */
 
 function ensurePopupLayer(): HTMLDivElement {
@@ -730,6 +940,13 @@ function renderPopup(): void {
   meta.textContent = `文本：${mark.text || '（无可见文本）'}`
   container.appendChild(meta)
 
+  // 2026-08-24: screenshot whiteboard. Available only when a screenshot was
+  // actually captured; empty/failed screenshots keep the text-only path.
+  if (mark.screenshot && mark.status !== 'sent') {
+    const { wrapper } = renderDrawingLayer(container, mark)
+    container.appendChild(wrapper)
+  }
+
   const actions = document.createElement('div')
   actions.className = 'dsh-point-ext-popup-actions'
 
@@ -745,29 +962,32 @@ function renderPopup(): void {
       if (comment === '' && !window.confirm('评论为空，确认直接发送所指内容？')) return
       popupBusy = true
       renderPopup()
-      const staged: Mark = { ...mark, comment, status: 'pending' }
-      updateMark(mark.index, { comment, status: 'pending' })
-      const sendTimeout = window.setTimeout(() => {
-        popupBusy = false
-        renderPopup()
-        showToast('发送超时：后台无响应，请重试。')
-      }, extSettings.sendWatchdogMs)
-      chrome.runtime.sendMessage({ type: 'STAGE_MARK', mark: staged, sendNow: true }, (res) => {
-        window.clearTimeout(sendTimeout)
-        popupBusy = false
-        if (chrome.runtime.lastError) {
+      void (async () => {
+        const prepared = await composeLocalMark(mark)
+        updateMark(mark.index, { screenshot: prepared.screenshot, comment, status: 'pending' })
+        const staged: Mark = { ...prepared, comment, status: 'pending' }
+        const sendTimeout = window.setTimeout(() => {
+          popupBusy = false
           renderPopup()
-          showToast(`发送失败：${chrome.runtime.lastError.message}`)
-          return
-        }
-        if (res && !res.ok) {
-          renderPopup()
-          showToast(`发送失败：${res.error || '未知错误'}`)
-          return
-        }
-        updateMark(mark.index, { status: 'sent' })
-        openMark(null)
-      })
+          showToast('发送超时：后台无响应，请重试。')
+        }, extSettings.sendWatchdogMs)
+        chrome.runtime.sendMessage({ type: 'STAGE_MARK', mark: staged, sendNow: true }, (res) => {
+          window.clearTimeout(sendTimeout)
+          popupBusy = false
+          if (chrome.runtime.lastError) {
+            renderPopup()
+            showToast(`发送失败：${chrome.runtime.lastError.message}`)
+            return
+          }
+          if (res && !res.ok) {
+            renderPopup()
+            showToast(`发送失败：${res.error || '未知错误'}`)
+            return
+          }
+          updateMark(mark.index, { status: 'sent' })
+          openMark(null)
+        })
+      })()
     })
 
     const stageBtn = document.createElement('button')
@@ -777,16 +997,21 @@ function renderPopup(): void {
     stageBtn.disabled = popupBusy
     stageBtn.addEventListener('click', (e) => {
       e.stopPropagation()
-      const staged: Mark = { ...mark, comment: textarea.value.trim(), status: 'pending' }
-      chrome.runtime.sendMessage({ type: 'STAGE_MARK', mark: staged, sendNow: false })
-        .then(() => {
-          updateMark(mark.index, { comment: staged.comment, status: 'pending' })
-          openMark(null)
-        })
-        .catch((err) => {
-          console.error('[dsh-point-ext] stage failed:', err)
-          showToast(`暂存失败：${err?.message || '未知错误'}。请重试。`)
-        })
+      const comment = textarea.value.trim()
+      void (async () => {
+        const prepared = await composeLocalMark(mark)
+        updateMark(mark.index, { screenshot: prepared.screenshot, comment, status: 'pending' })
+        const staged: Mark = { ...prepared, comment, status: 'pending' }
+        chrome.runtime.sendMessage({ type: 'STAGE_MARK', mark: staged, sendNow: false })
+          .then(() => {
+            updateMark(mark.index, { comment, status: 'pending' })
+            openMark(null)
+          })
+          .catch((err) => {
+            console.error('[dsh-point-ext] stage failed:', err)
+            showToast(`暂存失败：${err?.message || '未知错误'}。请重试。`)
+          })
+      })()
     })
 
     actions.appendChild(sendBtn)
@@ -994,6 +1219,49 @@ body.dsh-point-ext-marking .dsh-point-ext-badge { cursor: pointer; }
   background: rgba(37, 99, 235, 0.04);
   pointer-events: none;
   z-index: 2147482999;
+}
+/* 2026-08-24: 评论窗白板绘制层 */
+.dsh-point-ext-drawing {
+  position: relative;
+  margin: 10px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #f9fafb;
+}
+.dsh-point-ext-drawing-img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.dsh-point-ext-drawing-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.dsh-point-ext-drawing-toolbar {
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  background: #ffffff;
+  border-top: 1px solid #e5e7eb;
+}
+.dsh-point-ext-drawing-toolbar button {
+  flex: 1;
+  padding: 4px 6px;
+  font-size: 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #ffffff;
+  cursor: pointer;
+}
+.dsh-point-ext-drawing-toolbar button.active {
+  background: #ff2d55;
+  border-color: #ff2d55;
+  color: #ffffff;
 }
 `
   document.head.appendChild(style)
