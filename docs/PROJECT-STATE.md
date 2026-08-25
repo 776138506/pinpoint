@@ -21,7 +21,14 @@
 ## 待用户输入
 - （无）
 
-## 变更日志（纯增量，唯一的历史通道）
+## 变更日志
+
+### 2026-08-25：内层滚动容器失锚 + 弹窗按钮不可见修复
+
+- 现象：dsh 这类应用在内部容器滚动时，region 边框/徽标/弹窗停在视口原位不随内容走（用户报"边框随页面滑动、按钮看不到"）；popupLayer 是 fixed 定位但坐标又加了 window.scroll，window 滚动后弹窗被推出视口
+- 修法：mousedown 记录目标祖先链 scroll 快照（ScrollAnchor，全量记录、排除 body/documentElement 防与 window 滚动双重计数），region 边框/徽标/弹窗定位统一减 delta；FOCUS_MARK 跳转先复原锚点滚动；popup 改纯视口坐标 + 完整钳制（下方满→上方→钳进视口）
+- 测试：content.spec.ts +2 例（内层滚动 delta 跟随 + FOCUS_MARK 复原；window 滚动 popup 视口钳制），125/125 绿
+- 坑：jsdom 同文件存活的旧 content 实例会重复处理拖拽并各挂边框，测试取最后一个匹配元素（本实例最后挂载）（纯增量，唯一的历史通道）
 ### 2026-08-24 ｜ 侧栏暂存区持久化修复（关窗不丢暂存）
 - 根因：侧栏打开期间收到的 STAGE_MARK 只进 sidepanel 内存 state.outbox；side panel 文档一关即销毁，background 的 stagedQueue 只缓冲「侧栏关闭期间」到达的标记——已送达侧栏的标记无人留副本，重开即空
 - 变更：sidepanel.ts 新增 panelOutbox 写穿到 chrome.storage.session（微任务合批防抖），初始化时恢复并渲染；background 冲刷缓冲项与 panelOutbox 按 (tabId,index) 去重以新到为准；outbox 每次变更（入列/状态/删除/清空/编辑评论）都触发写穿

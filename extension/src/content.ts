@@ -60,6 +60,39 @@ let suppressClick = false
 // border div per mark that follows scroll/resize via repositionAll().
 const regionEls = new Map<number, HTMLElement>()
 
+// 2026-08-25: 内层滚动容器锚点——region 边框挂 documentElement 只跟随 window 滚动；
+// dsh 这类应用在内部容器里滚动时内容动、边框不动（视觉上边框"跟着页面滑"）。
+// mousedown 时记录目标祖先链全部元素及 scroll 快照，渲染时用 delta 修正。
+// 不做 overflow 检测：computed style/尺寸在 jsdom 与运行时行为不一致，且非滚动
+// 容器 scrollTop 恒不变（delta 恒 0），全量记录代价可忽略。排除 body/
+// documentElement——它们的滚动即 window 滚动，已由文档坐标系覆盖，计入会双重修正。
+interface ScrollAnchor { el: Element; top: number; left: number }
+let dragScrollAnchors: ScrollAnchor[] = []
+const regionAnchors = new Map<number, ScrollAnchor[]>()
+
+function collectScrollAnchors(el: Element): ScrollAnchor[] {
+  const anchors: ScrollAnchor[] = []
+  let cur = el.parentElement
+  while (cur !== null && cur !== document.body && cur !== document.documentElement) {
+    anchors.push({ el: cur, top: cur.scrollTop, left: cur.scrollLeft })
+    cur = cur.parentElement
+  }
+  return anchors
+}
+
+function regionDelta(index: number): { dx: number; dy: number } {
+  const anchors = regionAnchors.get(index)
+  if (anchors === undefined) return { dx: 0, dy: 0 }
+  let dx = 0
+  let dy = 0
+  for (const a of anchors) {
+    if (!a.el.isConnected) continue
+    dx += a.el.scrollLeft - a.left
+    dy += a.el.scrollTop - a.top
+  }
+  return { dx, dy }
+}
+
 // 2026-08-24: per-mark whiteboard strokes stored as ratios relative to the
 // original screenshot. Deleted when the mark is removed; composed into the
 // screenshot at send/stage time. ponytail: not persisted (lost on refresh).
@@ -210,6 +243,8 @@ function onMouseDown(e: MouseEvent): void {
   dragStartY = e.clientY
   dragStartScrollX = window.scrollX
   dragStartScrollY = window.scrollY
+  // 2026-08-25: 记录内层滚动锚点（见 ScrollAnchor 注释），供 region 标记失锚修正
+  dragScrollAnchors = collectScrollAnchors(el)
   isDragging = true
 }
 
@@ -323,6 +358,7 @@ function onScrollOrResize(): void {
   rafPending = true
   requestAnimationFrame(() => {
     rafPending = false
+    repositionRegions()
     repositionBadges()
     repositionPopup()
   })
@@ -437,6 +473,9 @@ async function captureRegionInner(rect: { x: number; y: number; width: number; h
     status: 'draft',
     anchor: { rect },
   }
+  // 2026-08-25: 锚点随 mark 落库（内存级），截图失败也要保留——失锚修正不依赖截图
+  if (dragScrollAnchors.length > 0) regionAnchors.set(mark.index, dragScrollAnchors)
+  dragScrollAnchors = []
 
   try {
     const de = document.documentElement
@@ -531,6 +570,7 @@ function removeMark(index: number): void {
   const mark = state.marks.find(m => m.index === index)
   if (mark) releaseElement(mark)
   strokeMap.delete(index)
+  regionAnchors.delete(index)
   setState({
     ...state,
     marks: state.marks.filter(m => m.index !== index),
@@ -548,6 +588,7 @@ function updateMark(index: number, patch: Partial<Omit<Mark, 'index'>>): void {
 function clearMarks(): void {
   for (const mark of state.marks) releaseElement(mark)
   for (const index of strokeMap.keys()) strokeMap.delete(index)
+  regionAnchors.clear()
   setState({ ...state, marks: [], activeIndex: null, nextIndex: 1 })
 }
 
@@ -606,10 +647,7 @@ function renderBadges(): void {
         document.documentElement.appendChild(border)
         regionEls.set(mark.index, border)
       }
-      border.style.left = `${regionRect.x}px`
-      border.style.top = `${regionRect.y}px`
-      border.style.width = `${regionRect.width}px`
-      border.style.height = `${regionRect.height}px`
+      // 定位统一走 repositionRegions()（含内层滚动 delta 修正），此处只建元素
       continue
     }
     const el = resolveElement(mark)
@@ -624,7 +662,24 @@ function renderBadges(): void {
       ;(el as unknown as Record<string, unknown>)[KEPT_FLAG] = true
     }
   }
+  repositionRegions()
   repositionBadges()
+}
+
+// 2026-08-25: region 边框定位统一入口——文档坐标减去内层滚动容器 delta，
+// 使边框在内层滚动（dsh 类应用）时跟随内容，而不是停在视口原位
+function repositionRegions(): void {
+  for (const mark of state.marks) {
+    const regionRect = parseRegionSelector(mark.selector)
+    if (regionRect === null) continue
+    const border = regionEls.get(mark.index)
+    if (border === undefined) continue
+    const d = regionDelta(mark.index)
+    border.style.left = `${regionRect.x - d.dx}px`
+    border.style.top = `${regionRect.y - d.dy}px`
+    border.style.width = `${regionRect.width}px`
+    border.style.height = `${regionRect.height}px`
+  }
 }
 
 function repositionBadges(): void {
@@ -634,9 +689,10 @@ function repositionBadges(): void {
     if (badge === null) continue
     const regionRect = parseRegionSelector(mark.selector)
     if (regionRect !== null) {
+      const d = regionDelta(mark.index)
       badge.style.display = ''
-      badge.style.left = `${regionRect.x - window.scrollX}px`
-      badge.style.top = `${regionRect.y - window.scrollY}px`
+      badge.style.left = `${regionRect.x - d.dx - window.scrollX}px`
+      badge.style.top = `${regionRect.y - d.dy - window.scrollY}px`
       continue
     }
     const el = resolveElement(mark)
@@ -680,6 +736,17 @@ function focusMark(index: number): { ok: boolean; error?: string } {
   if (regionRect !== null) {
     const border = regionEls.get(mark.index)
     if (!border) return { ok: false, error: '无法定位区域标记（页面已刷新）' }
+    // 2026-08-25: 内层容器锚点复原——区域被内层滚动带走时，scrollIntoView 只会
+    // 滚 window（边框挂在 documentElement），必须先把各锚点滚回捕获时位置
+    const anchors = regionAnchors.get(mark.index)
+    if (anchors !== undefined) {
+      for (const a of anchors) {
+        if (!a.el.isConnected) continue
+        a.el.scrollTop = a.top
+        a.el.scrollLeft = a.left
+      }
+      repositionRegions()
+    }
     // jsdom 没有 scrollIntoView；运行时判断，避免测试崩溃。
     if (typeof border.scrollIntoView === 'function') {
       border.scrollIntoView({ block: 'center', behavior: 'smooth' })
@@ -1045,10 +1112,11 @@ function repositionPopup(): void {
   let r: { left: number; top: number; bottom: number; width: number }
   const regionRect = parseRegionSelector(mark.selector)
   if (regionRect !== null) {
+    const d = regionDelta(mark.index)
     r = {
-      left: regionRect.x - window.scrollX,
-      top: regionRect.y - window.scrollY,
-      bottom: regionRect.y + regionRect.height - window.scrollY,
+      left: regionRect.x - d.dx - window.scrollX,
+      top: regionRect.y - d.dy - window.scrollY,
+      bottom: regionRect.y + regionRect.height - d.dy - window.scrollY,
       width: regionRect.width,
     }
   } else {
@@ -1070,9 +1138,15 @@ function repositionPopup(): void {
   const bw = container.offsetWidth
   const bh = container.offsetHeight
   if (left + bw > vw) left = Math.max(pad, vw - bw - pad)
-  if (top + bh > vh && r.top - bh - pad > 0) top = r.top - bh - pad
-  container.style.top = `${top + window.scrollY}px`
-  container.style.left = `${left + window.scrollX}px`
+  // 2026-08-25: 下方放不下优先放上方；上方也不够或标记滚出视口时钳进视口，
+  // 保证按钮可见（原实现标记在视口外时弹窗跟着出视口，按钮看不到）
+  if (top + bh > vh && r.top - bh - pad >= pad) top = r.top - bh - pad
+  if (top + bh > vh) top = Math.max(pad, vh - bh - pad)
+  if (top < pad) top = pad
+  // 2026-08-25: popupLayer 是 position:fixed，子元素用视口坐标——原实现再加
+  // window.scroll 双重计数，window 滚动后弹窗被推出视口
+  container.style.top = `${top}px`
+  container.style.left = `${left}px`
 }
 
 /* ---------- styles ---------- */

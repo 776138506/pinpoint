@@ -499,3 +499,85 @@ describe('扩展侧评论窗绘画层（2026-08-24）', () => {
     expect((stageCalls[0]![0] as { mark: { screenshot: string } }).mark.screenshot).toBe('composed-screenshot')
   })
 })
+
+describe('扩展侧内层滚动容器锚定（2026-08-25：dsh 类应用内层滚动失锚 / popup 按钮看不到）', () => {
+  // jsdom 无 pretendToBeVisual 时没有 requestAnimationFrame，同步执行即可
+  function stubRaf(): void {
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => { cb(0); return 0 })
+  }
+  function stubScroll(x: number, y: number): void {
+    Object.defineProperty(window, 'scrollX', { configurable: true, get: () => x })
+    Object.defineProperty(window, 'scrollY', { configurable: true, get: () => y })
+  }
+  afterEach(() => { stubScroll(0, 0) })
+
+  it('内层容器滚动后 region 边框按 delta 跟随内容；FOCUS_MARK 复原锚点滚动', async () => {
+    const h = setup()
+    stubRaf()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const scroller = document.createElement('div')
+    scroller.style.overflow = 'auto'
+    const target = document.createElement('div')
+    scroller.appendChild(target)
+    document.body.appendChild(scroller)
+
+    // 独特坐标 33x41，避开同文件早前用例残留在 documentElement 上的边框
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 17, clientY: 23 },
+      { type: 'mousemove', clientX: 50, clientY: 64 },
+      { type: 'mouseup', clientX: 50, clientY: 64 },
+    ])
+    await flushAsync()
+
+    // 同文件早前用例的 content 实例仍挂在 document 上且标记态未关，本次拖拽会
+    // 被每个存活实例各捕获一次、各挂一个 33x41 边框；本实例最后注册、边框最后
+    // 挂载，取最后一个匹配（第一个可能是旧实例的，FOCUS_MARK 只修正本实例的）
+    const matches = Array.from(document.querySelectorAll<HTMLElement>('.dsh-point-ext-region-kept'))
+      .filter(b => b.style.width === '33px' && b.style.height === '41px')
+    const border = matches[matches.length - 1]
+    expect(border).toBeDefined()
+    expect(border!.style.top).toBe('23px')
+
+    // 内层容器滚动 100px：内容上移，边框必须跟上（否则视觉上边框"跟着页面滑"）
+    scroller.scrollTop = 100
+    scroller.dispatchEvent(new Event('scroll'))
+    await flushAsync()
+    expect(border!.style.top).toBe('-77px')
+
+    // 暂存列表跳转：复原锚点滚动位置，边框回到原始位置
+    const res = h.fireMessage({ type: 'FOCUS_MARK', index: 1 }) as { ok: boolean }
+    expect(res.ok).toBe(true)
+    expect(scroller.scrollTop).toBe(0)
+    expect(border!.style.top).toBe('23px')
+  })
+
+  it('window 滚动后 popup 用视口坐标且钳进视口（不重复加滚动量）', async () => {
+    const h = setup()
+    stubRaf()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    stubScroll(0, 300)
+    const target = document.createElement('div')
+    target.id = 'ext-popup-clamp-target'
+    target.textContent = 'x'
+    target.style.width = '500px'
+    target.style.height = '500px'
+    document.body.appendChild(target)
+
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 100, clientY: 100 },
+      { type: 'mousemove', clientX: 103, clientY: 105 },
+      { type: 'mouseup', clientX: 103, clientY: 105 },
+      { type: 'click', clientX: 103, clientY: 105 },
+    ])
+    await flushAsync()
+
+    const popup = document.querySelector<HTMLElement>('.dsh-point-ext-popup')
+    expect(popup).not.toBeNull()
+    // jsdom 中 getBoundingClientRect 全 0：r.bottom=0 → top=pad=8；
+    // 修复前会再 +window.scrollY=300 变成 308px 被推出视口
+    expect(popup!.style.top).toBe('8px')
+    expect(popup!.style.left).toBe('0px')
+  })
+})
