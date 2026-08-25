@@ -23,6 +23,16 @@
 
 ## 变更日志
 
+### 2026-08-25：白板画笔模式（页面级涂抹）
+
+- 需求：两种模式互证——标记模式圈出要移动的元素，白板模式画箭头/矩形给出目标位置；涂抹内容截图发 dsh
+- 形态：侧栏「白板涂抹」按钮（START_DRAWING 经 background 注入重试中继，一次性触发非 toggle）→ 页面盖全屏画布 + 浮动工具条（画笔/箭头/矩形/撤销/清空/完成/退出）→ 笔迹文档坐标存储、内层滚动锚点跟踪（首笔 elementFromPoint 取底层元素）→「完成」= 笔迹包围盒 +16px 截屏 + 笔迹归一化入 strokeMap，产出普通 region mark 复用暂存/发送管线（发送时 composeScreenshot 合成）
+- 关键顺序：先 exitDrawingMode 撤画布再截图（否则笔迹截进底图双重叠加）；strokeMap 先于 addMark 挂载（setState 同步渲染 popup）
+- Esc 层级：白板态 > 工具态 > 拖拽态 > 标记态；画布在 OWN_UI_SELECTOR 内，标记/框选处理器天然不响应画布事件（两模式并存不互抢）
+- 测试：content.spec +5 例（完成流程/空板守卫/Esc 退出/并存互斥/工具切换），sidepanel.spec fixture 补 start-drawing 按钮；130/130 绿
+- ponytail 上限：白板笔迹不持久化（刷新即丢）；多内层滚动容器只跟踪首笔落点链
+
+
 ### 2026-08-25：内层滚动容器失锚 + 弹窗按钮不可见修复
 
 - 现象：dsh 这类应用在内部容器滚动时，region 边框/徽标/弹窗停在视口原位不随内容走（用户报"边框随页面滑动、按钮看不到"）；popupLayer 是 fixed 定位但坐标又加了 window.scroll，window 滚动后弹窗被推出视口

@@ -29,6 +29,7 @@ const PANEL_DOM = `
   <button id="create-session"></button>
   <button id="refresh-sessions"></button>
   <button id="toggle-marking"></button>
+  <button id="start-drawing"></button>
   <div id="mark-hint"></div>
   <div id="outbox"></div>
   <button id="send-all"></button>

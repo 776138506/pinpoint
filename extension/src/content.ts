@@ -144,7 +144,7 @@ function showHint(message: string): void {
 // 2026-08-20: 插件自有 UI 选择器——标记模式下悬停/点击必须排除（评论窗/角标/提示条）。
 // 教训：不可用 [class*="dsh-point-ext"] 子串匹配——body 上的标记态类名
 // dsh-point-ext-marking 会让每个元素都被排除，标记功能全灭（2026-08-21 事故）
-const OWN_UI_SELECTOR = '.dsh-point-ext-overlay, .dsh-point-ext-badge, .dsh-point-ext-popup-layer, .dsh-point-ext-popup, .dsh-point-ext-toast'
+const OWN_UI_SELECTOR = '.dsh-point-ext-overlay, .dsh-point-ext-badge, .dsh-point-ext-popup-layer, .dsh-point-ext-popup, .dsh-point-ext-toast, .dsh-point-ext-board, .dsh-point-ext-board-toolbar'
 
 function highlight(el: Element): void {
   if (!el || el.nodeType !== 1) return
@@ -285,8 +285,9 @@ function onMouseUp(e: MouseEvent): void {
   if (dragged) {
     suppressClick = true
     const rect = regionRectFromDrag(e)
-    if (rect !== null) void captureRegion(rect)
+    if (rect !== null) void captureRegion(rect, dragScrollAnchors)
   }
+  dragScrollAnchors = []
 }
 
 function onClick(e: MouseEvent): void {
@@ -318,6 +319,11 @@ function onClick(e: MouseEvent): void {
 function onKeyDown(e: KeyboardEvent): void {
   if (!chrome.runtime?.id) return // 同上：失效旧实例静默
   if (e.repeat) return // 2026-08-24: 长按 repeat 会反复 toggle 标记态，只认第一次
+  // 2026-08-25: Esc 最高层是白板模式（比标记态更靠近用户当前注意力）
+  if (e.key === 'Escape' && drawingMode) {
+    exitDrawingMode()
+    return
+  }
   if (e.key === 'Escape' && state.marking) {
     // 2026-08-24: Esc 层级：工具态 > 拖拽态 > 标记态。
     // 工具态下只退出工具，不退出标记模式，也不关闭 popup。
@@ -361,7 +367,242 @@ function onScrollOrResize(): void {
     repositionRegions()
     repositionBadges()
     repositionPopup()
+    redrawBoard()
   })
+}
+
+/* ---------- 页面白板（2026-08-25：画笔模式——直接在页面上涂抹，截图发给 dsh） ---------- */
+
+// 与标记模式并存：画布盖住页面接管鼠标（已有标记保持显示，两模式互证——标记
+// 模式圈出要移动的元素，白板模式画箭头给出目标位置）。「完成」= 笔迹包围盒
+// 截屏 + 笔迹归一化入 strokeMap，产出普通 region mark，复用暂存/发送管线。
+let drawingMode = false
+let boardCanvas: HTMLCanvasElement | null = null
+let boardCtx: CanvasRenderingContext2D | null = null
+let boardToolbar: HTMLElement | null = null
+let boardStrokes: Stroke[] = [] // 文档坐标（px，非归一化）
+let boardActive: Stroke | null = null
+let boardTool: DrawTool = 'pen'
+let boardAnchors: ScrollAnchor[] = [] // 首笔落点处元素的内层滚动锚点
+
+function boardDelta(): { dx: number; dy: number } {
+  let dx = 0
+  let dy = 0
+  for (const a of boardAnchors) {
+    if (!a.el.isConnected) continue
+    dx += a.el.scrollLeft - a.left
+    dy += a.el.scrollTop - a.top
+  }
+  return { dx, dy }
+}
+
+// 文档坐标 = 客户区坐标 + window 滚动 + 内层容器滚动 delta
+function boardPoint(e: MouseEvent): { x: number; y: number } {
+  const d = boardDelta()
+  return { x: e.clientX + window.scrollX + d.dx, y: e.clientY + window.scrollY + d.dy }
+}
+
+function redrawBoard(): void {
+  if (boardCanvas === null || boardCtx === null) return
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  if (vw <= 0 || vh <= 0) return
+  if (boardCanvas.width !== vw || boardCanvas.height !== vh) {
+    boardCanvas.width = vw
+    boardCanvas.height = vh
+  }
+  boardCtx.clearRect(0, 0, vw, vh)
+  // drawStrokes 走归一化坐标——文档坐标换算成「当前视口」归一化，复用其几何实现
+  const d = boardDelta()
+  const offX = window.scrollX + d.dx
+  const offY = window.scrollY + d.dy
+  const toView = (s: Stroke): Stroke => ({
+    tool: s.tool,
+    points: s.points.map((v, i) => (i % 2 === 0 ? (v - offX) / vw : (v - offY) / vh)),
+  })
+  const all = boardActive !== null ? [...boardStrokes, boardActive] : boardStrokes
+  drawStrokes(boardCtx, all.map(toView), vw, vh)
+}
+
+function onBoardDown(e: MouseEvent): void {
+  if (!chrome.runtime?.id) return
+  if (e.button !== 0) return
+  e.preventDefault()
+  e.stopPropagation()
+  // 首笔收集落点处元素的内层滚动锚点——画布盖住页面，需临时隐藏才能取到底层元素
+  if (boardAnchors.length === 0 && boardCanvas !== null) {
+    boardCanvas.style.visibility = 'hidden'
+    let under: Element | null = null
+    try {
+      under = document.elementFromPoint(e.clientX, e.clientY)
+    } catch (err) {
+      // jsdom 未实现 elementFromPoint；运行时失败也只是退化为不跟踪内层滚动
+      console.error('[dsh-point-ext] elementFromPoint failed:', err)
+    }
+    boardCanvas.style.visibility = ''
+    if (under !== null) boardAnchors = collectScrollAnchors(under)
+  }
+  const p = boardPoint(e)
+  boardActive = { tool: boardTool, points: [p.x, p.y, p.x, p.y] }
+  redrawBoard()
+}
+
+function onBoardMove(e: MouseEvent): void {
+  if (boardActive === null) return
+  e.preventDefault()
+  const p = boardPoint(e)
+  if (boardActive.tool === 'pen') {
+    boardActive.points.push(p.x, p.y)
+  } else {
+    // arrow/rect：终点跟随当前位置
+    boardActive.points[2] = p.x
+    boardActive.points[3] = p.y
+  }
+  redrawBoard()
+}
+
+function onBoardUp(e: MouseEvent): void {
+  if (boardActive === null) return
+  e.preventDefault()
+  const p = boardPoint(e)
+  if (boardActive.tool === 'pen') {
+    boardActive.points.push(p.x, p.y)
+  } else {
+    boardActive.points[2] = p.x
+    boardActive.points[3] = p.y
+  }
+  boardStrokes.push(boardActive)
+  boardActive = null
+  redrawBoard()
+}
+
+async function finishBoard(): Promise<void> {
+  if (boardStrokes.length === 0) {
+    showToast('白板上还没有涂抹内容')
+    return
+  }
+  // 笔迹包围盒 + 边距，钳到文档范围
+  let x1 = Infinity
+  let y1 = Infinity
+  let x2 = -Infinity
+  let y2 = -Infinity
+  for (const s of boardStrokes) {
+    for (let i = 0; i < s.points.length; i += 2) {
+      x1 = Math.min(x1, s.points[i]!)
+      y1 = Math.min(y1, s.points[i + 1]!)
+      x2 = Math.max(x2, s.points[i]!)
+      y2 = Math.max(y2, s.points[i + 1]!)
+    }
+  }
+  const pad = 16
+  const de = document.documentElement
+  const maxX = de.scrollWidth > 0 ? de.scrollWidth : Number.POSITIVE_INFINITY
+  const maxY = de.scrollHeight > 0 ? de.scrollHeight : Number.POSITIVE_INFINITY
+  const rx = Math.max(0, Math.min(x1 - pad, maxX))
+  const ry = Math.max(0, Math.min(y1 - pad, maxY))
+  const rx2 = Math.max(0, Math.min(x2 + pad, maxX))
+  const ry2 = Math.max(0, Math.min(y2 + pad, maxY))
+  const rect = { x: Math.round(rx), y: Math.round(ry), width: Math.round(rx2 - rx), height: Math.round(ry2 - ry) }
+  if (rect.width < 2 || rect.height < 2) {
+    showToast('涂抹区域过小，无法生成所指')
+    return
+  }
+  // 笔迹归一化到包围盒（= 截图坐标系），随 mark 入 strokeMap 由发送管线合成
+  const strokes: Stroke[] = boardStrokes.map(s => ({
+    tool: s.tool,
+    points: s.points.map((v, i) => (i % 2 === 0 ? (v - rect.x) / rect.width : (v - rect.y) / rect.height)),
+  }))
+  const anchors = boardAnchors
+  // 先撤画布再截图——否则笔迹被 html2canvas 截进底图，发送时合成会双重叠加
+  exitDrawingMode()
+  await captureRegion(rect, anchors, strokes)
+}
+
+function enterDrawingMode(): void {
+  if (drawingMode) return
+  drawingMode = true
+  boardStrokes = []
+  boardActive = null
+  boardAnchors = []
+  boardTool = 'pen'
+
+  boardCanvas = document.createElement('canvas')
+  boardCanvas.className = 'dsh-point-ext-board'
+  boardCanvas.addEventListener('mousedown', onBoardDown)
+  boardCanvas.addEventListener('mousemove', onBoardMove)
+  boardCanvas.addEventListener('mouseup', onBoardUp)
+  document.documentElement.appendChild(boardCanvas)
+  // jsdom 无 2d 上下文（返回 null）——笔迹照常记录，仅缺实时渲染
+  boardCtx = boardCanvas.getContext('2d')
+
+  boardToolbar = document.createElement('div')
+  boardToolbar.className = 'dsh-point-ext-board-toolbar'
+  const tools: { tool: DrawTool; label: string }[] = [
+    { tool: 'pen', label: '画笔' },
+    { tool: 'arrow', label: '箭头' },
+    { tool: 'rect', label: '矩形' },
+  ]
+  for (const t of tools) {
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.dataset.tool = t.tool
+    btn.textContent = t.label
+    btn.classList.toggle('active', t.tool === boardTool)
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      boardTool = t.tool
+      boardToolbar?.querySelectorAll('button[data-tool]').forEach(b => b.classList.toggle('active', (b as HTMLElement).dataset.tool === t.tool))
+    })
+    boardToolbar.appendChild(btn)
+  }
+  const undoBtn = document.createElement('button')
+  undoBtn.type = 'button'
+  undoBtn.textContent = '撤销'
+  undoBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    boardStrokes.pop()
+    redrawBoard()
+  })
+  boardToolbar.appendChild(undoBtn)
+  const clearBtn = document.createElement('button')
+  clearBtn.type = 'button'
+  clearBtn.textContent = '清空'
+  clearBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    boardStrokes = []
+    redrawBoard()
+  })
+  boardToolbar.appendChild(clearBtn)
+  const finishBtn = document.createElement('button')
+  finishBtn.type = 'button'
+  finishBtn.textContent = '完成'
+  finishBtn.className = 'primary'
+  finishBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    void finishBoard()
+  })
+  boardToolbar.appendChild(finishBtn)
+  const exitBtn = document.createElement('button')
+  exitBtn.type = 'button'
+  exitBtn.textContent = '退出'
+  exitBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    exitDrawingMode()
+  })
+  boardToolbar.appendChild(exitBtn)
+  document.documentElement.appendChild(boardToolbar)
+
+  redrawBoard()
+}
+
+function exitDrawingMode(): void {
+  drawingMode = false
+  boardStrokes = []
+  boardActive = null
+  boardAnchors = []
+  if (boardCanvas !== null) { boardCanvas.remove(); boardCanvas = null }
+  boardCtx = null
+  if (boardToolbar !== null) { boardToolbar.remove(); boardToolbar = null }
 }
 
 /* ---------- capture ---------- */
@@ -446,17 +687,17 @@ async function captureElement(el: Element): Promise<void> {
   }
 }
 
-async function captureRegion(rect: { x: number; y: number; width: number; height: number }): Promise<void> {
+async function captureRegion(rect: { x: number; y: number; width: number; height: number }, anchors: ScrollAnchor[] = [], strokes?: Stroke[]): Promise<void> {
   if (captureInFlight) return
   captureInFlight = true
   try {
-    await captureRegionInner(rect)
+    await captureRegionInner(rect, anchors, strokes)
   } finally {
     captureInFlight = false
   }
 }
 
-async function captureRegionInner(rect: { x: number; y: number; width: number; height: number }): Promise<void> {
+async function captureRegionInner(rect: { x: number; y: number; width: number; height: number }, anchors: ScrollAnchor[], strokes?: Stroke[]): Promise<void> {
   settleDraft()
   const mark: Mark = {
     index: state.nextIndex,
@@ -474,8 +715,10 @@ async function captureRegionInner(rect: { x: number; y: number; width: number; h
     anchor: { rect },
   }
   // 2026-08-25: 锚点随 mark 落库（内存级），截图失败也要保留——失锚修正不依赖截图
-  if (dragScrollAnchors.length > 0) regionAnchors.set(mark.index, dragScrollAnchors)
-  dragScrollAnchors = []
+  if (anchors.length > 0) regionAnchors.set(mark.index, anchors)
+  // 2026-08-25: 白板笔迹必须先于 addMark 入 strokeMap——setState 同步渲染 popup，
+  // 挂晚了 popup 白板画布读不到本次笔迹
+  if (strokes !== undefined && strokes.length > 0) strokeMap.set(mark.index, strokes)
 
   try {
     const de = document.documentElement
@@ -1294,6 +1537,49 @@ body.dsh-point-ext-marking .dsh-point-ext-badge { cursor: pointer; }
   pointer-events: none;
   z-index: 2147482999;
 }
+/* 2026-08-25: 页面白板——画布低于徽标/弹窗（pointer-events 在画布上，标记层均
+   pointer-events:none 不影响作画）；工具条最高，保证始终可点 */
+.dsh-point-ext-board {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 2147482998;
+  cursor: crosshair;
+  background: transparent;
+}
+.dsh-point-ext-board-toolbar {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483003;
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.18);
+}
+.dsh-point-ext-board-toolbar button {
+  padding: 6px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #374151;
+  font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  cursor: pointer;
+}
+.dsh-point-ext-board-toolbar button.active {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #ffffff;
+}
+.dsh-point-ext-board-toolbar button.primary {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #ffffff;
+}
 /* 2026-08-24: 评论窗白板绘制层 */
 .dsh-point-ext-drawing {
   position: relative;
@@ -1406,6 +1692,11 @@ function mount(): void {
           status: m.status,
         })),
       })
+      return false
+    }
+    if (message?.type === 'START_DRAWING') {
+      enterDrawingMode()
+      sendResponse({ drawing: drawingMode })
       return false
     }
     if (message?.type === 'FOCUS_MARK') {

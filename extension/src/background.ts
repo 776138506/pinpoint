@@ -91,22 +91,28 @@ async function checkConnection(): Promise<{ connected: boolean; error?: string }
  * 2026-08-20: 切换标记模式，content script 未注入时按需注入后重试一次。
  * 页面先于扩展安装/重载打开时，MV3 不会自动补注入，直接 sendMessage 会
  * "Receiving end does not exist" 静默失败（侧栏点击「开始标记」无反应的根因）。
+ * 2026-08-25: 抽出 sendWithInject 供 START_DRAWING 复用同一注入重试路径。
  */
-async function toggleMarkingOnTab(tabId: number): Promise<{ marking?: boolean; error?: string }> {
+async function sendWithInject<T>(tabId: number, message: unknown): Promise<{ res?: T; error?: string }> {
   try {
-    const res = await chrome.tabs.sendMessage(tabId, { type: 'TOGGLE_MARKING' }) as { marking?: boolean }
-    return { marking: res?.marking }
+    const res = await chrome.tabs.sendMessage(tabId, message) as T
+    return { res }
   } catch (e) {
     console.debug('[dsh-point-ext] initial sendMessage failed, injecting content script:', e)
     try {
       await chrome.scripting.executeScript({ target: { tabId }, files: ['dist/content.js'] })
-      const res = await chrome.tabs.sendMessage(tabId, { type: 'TOGGLE_MARKING' }) as { marking?: boolean }
-      return { marking: res?.marking }
-    } catch (e) {
-      console.error('[dsh-point-ext] toggle marking failed:', e)
+      const res = await chrome.tabs.sendMessage(tabId, message) as T
+      return { res }
+    } catch (e2) {
+      console.error('[dsh-point-ext] send with inject failed:', e2)
       return { error: '当前页面不支持标记（浏览器内部页 / PDF 查看器 / 扩展页），或刷新该网页后重试' }
     }
   }
+}
+
+async function toggleMarkingOnTab(tabId: number): Promise<{ marking?: boolean; error?: string }> {
+  const { res, error } = await sendWithInject<{ marking?: boolean }>(tabId, { type: 'TOGGLE_MARKING' })
+  return error !== undefined ? { error } : { marking: res?.marking }
 }
 
 /**
@@ -351,6 +357,22 @@ chrome.runtime.onConnect.addListener((port) => {
               type: 'MARKING_STATE',
               marking: now?.id !== undefined ? markingTabs.has(now.id) : outcome.marking,
             })
+          }
+          break
+        }
+        case 'START_DRAWING': {
+          // 2026-08-25: 白板画笔是一次性触发（非持续 toggle）——画布工具条自带
+          // 完成/退出，Esc 也可退出，无需按 tab 跟踪状态
+          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+          if (!tab?.id) {
+            postToPanel({ type: 'DRAWING_ERROR', error: '没有活动标签页' })
+            break
+          }
+          const { res, error } = await sendWithInject<{ drawing?: boolean }>(tab.id, { type: 'START_DRAWING' })
+          if (error !== undefined) {
+            postToPanel({ type: 'DRAWING_ERROR', error })
+          } else {
+            postToPanel({ type: 'DRAWING_STATE', drawing: res?.drawing === true })
           }
           break
         }

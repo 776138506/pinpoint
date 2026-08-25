@@ -581,3 +581,128 @@ describe('扩展侧内层滚动容器锚定（2026-08-25：dsh 类应用内层�
     expect(popup!.style.left).toBe('0px')
   })
 })
+
+describe('扩展侧页面白板模式（2026-08-25：画笔涂抹 → 截图发 dsh）', () => {
+  // 白板画布挂在 documentElement（body.innerHTML 清不到）且旧实例可能保持
+  // drawingMode——每个用例后物理清除残留画布/工具条，防跨用例干扰断言
+  afterEach(() => {
+    document.querySelectorAll('.dsh-point-ext-board, .dsh-point-ext-board-toolbar').forEach(el => el.remove())
+  })
+
+  function startBoard(h: Harness): HTMLCanvasElement {
+    const res = h.fireMessage({ type: 'START_DRAWING' }) as { drawing: boolean }
+    expect(res.drawing).toBe(true)
+    const canvas = document.querySelector<HTMLCanvasElement>('.dsh-point-ext-board')
+    expect(canvas).not.toBeNull()
+    return canvas!
+  }
+  function finishButton(): HTMLButtonElement {
+    const btn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '完成')
+    expect(btn).toBeDefined()
+    return btn!
+  }
+  function drawPenStroke(canvas: HTMLElement, from: [number, number], to: [number, number]): void {
+    canvas.dispatchEvent(new MouseEvent('mousedown', { clientX: from[0], clientY: from[1], button: 0, bubbles: true }))
+    canvas.dispatchEvent(new MouseEvent('mousemove', { clientX: to[0], clientY: to[1], bubbles: true }))
+    canvas.dispatchEvent(new MouseEvent('mouseup', { clientX: to[0], clientY: to[1], bubbles: true }))
+  }
+
+  it('画笔涂抹一笔 → 完成生成笔迹包围盒 region mark，发送时合成笔迹', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    vi.mocked(composeScreenshot).mockClear()
+    const h = setup()
+    await import('./content.ts')
+    const canvas = startBoard(h)
+
+    drawPenStroke(canvas, [100, 100], [150, 120])
+    finishButton().click()
+    await flushAsync()
+    await flushAsync()
+
+    // 画布已撤（避免笔迹截进底图双重叠加），mark = 包围盒 +16 边距
+    expect(document.querySelector('.dsh-point-ext-board')).toBeNull()
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ selector: string }> }
+    expect(s.marks).toHaveLength(1)
+    expect(s.marks[0]!.selector).toBe('region:84,84,82,52')
+
+    // popup 已打开且带白板绘画层（笔迹可见可续画）
+    expect(document.querySelector('.dsh-point-ext-drawing-canvas')).not.toBeNull()
+
+    // 发送：笔迹合成进截图
+    const sendBtn = document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-popup-btn.primary')[0]!
+    sendBtn.click()
+    await flushAsync()
+    expect(vi.mocked(composeScreenshot)).toHaveBeenCalledTimes(1)
+    const strokes = vi.mocked(composeScreenshot).mock.calls[0]![1] as Array<{ tool: string; points: number[] }>
+    expect(strokes).toHaveLength(1)
+    expect(strokes[0]!.tool).toBe('pen')
+    // 归一化到包围盒坐标系：(100-84)/82
+    expect(strokes[0]!.points[0]).toBeCloseTo(16 / 82, 5)
+    const stageCalls = h.sendMessage.mock.calls.filter(
+      c => (c[0] as { type?: string }).type === 'STAGE_MARK',
+    )
+    expect(stageCalls).toHaveLength(1)
+    expect((stageCalls[0]![0] as { mark: { screenshot: string } }).mark.screenshot).toBe('composed-screenshot')
+  })
+
+  it('空白板点完成：提示且不产出 mark，白板保持', async () => {
+    const h = setup()
+    await import('./content.ts')
+    startBoard(h)
+
+    finishButton().click()
+    await flushAsync()
+
+    expect(document.querySelector('.dsh-point-ext-toast')?.textContent).toContain('还没有涂抹内容')
+    expect(document.querySelector('.dsh-point-ext-board')).not.toBeNull()
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: unknown[] }
+    expect(s.marks).toHaveLength(0)
+  })
+
+  it('Esc 退出白板：画布移除、无 mark、标记态不受影响', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const canvas = startBoard(h)
+    drawPenStroke(canvas, [10, 10], [50, 50])
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+
+    expect(document.querySelector('.dsh-point-ext-board')).toBeNull()
+    expect(document.querySelector('.dsh-point-ext-board-toolbar')).toBeNull()
+    // 标记态不断言 body 类名——存活旧实例也会响应 Esc 把共享 body 类名摘掉；
+    // 改断言本实例状态（GET_STATE 是实例级的，不受串扰）
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marking: boolean; marks: unknown[] }
+    expect(s.marking).toBe(true)
+    expect(s.marks).toHaveLength(0)
+  })
+
+  it('白板模式下画布接管点击，不触发元素捕获（两模式并存不互抢）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const canvas = startBoard(h)
+
+    drawPenStroke(canvas, [10, 10], [50, 50])
+    canvas.dispatchEvent(new MouseEvent('click', { clientX: 30, clientY: 30, bubbles: true }))
+    await flushAsync()
+
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: unknown[] }
+    expect(s.marks).toHaveLength(0)
+  })
+
+  it('工具切换：箭头/矩形按钮激活态互斥', async () => {
+    const h = setup()
+    await import('./content.ts')
+    startBoard(h)
+
+    const arrowBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.dataset.tool === 'arrow')!
+    arrowBtn.click()
+    expect(arrowBtn.classList.contains('active')).toBe(true)
+    const penBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.dataset.tool === 'pen')!
+    expect(penBtn.classList.contains('active')).toBe(false)
+  })
+})

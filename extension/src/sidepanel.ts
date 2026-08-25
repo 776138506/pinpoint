@@ -141,6 +141,7 @@ const sessionSelect = reqEl<HTMLSelectElement>('session-select')
 const createSessionBtn = reqEl<HTMLButtonElement>('create-session')
 const refreshSessionsBtn = reqEl<HTMLButtonElement>('refresh-sessions')
 const toggleMarkingBtn = reqEl<HTMLButtonElement>('toggle-marking')
+const startDrawingBtn = reqEl<HTMLButtonElement>('start-drawing')
 const markHintEl = reqEl<HTMLDivElement>('mark-hint')
 const outboxEl = reqEl<HTMLDivElement>('outbox')
 const sendAllBtn = reqEl<HTMLButtonElement>('send-all')
@@ -380,6 +381,11 @@ toggleMarkingBtn.addEventListener('click', () => {
   safePost({ type: 'TOGGLE_MARKING' })
 })
 
+// 2026-08-25: 白板涂抹——一次性触发（画布工具条自带完成/退出，Esc 亦可退出）
+startDrawingBtn.addEventListener('click', () => {
+  safePost({ type: 'START_DRAWING' })
+})
+
 sendAllBtn.addEventListener('click', () => {
   for (const item of state.outbox) {
     if (item.status !== 'sent' && item.status !== 'sending') {
@@ -432,6 +438,17 @@ function onPortMessage(message: any): void {
       break
     case 'MARKING_ERROR':
       markHintEl.textContent = message.error || '标记切换失败'
+      markHintEl.style.color = '#dc2626'
+      break
+    case 'DRAWING_STATE':
+      // 2026-08-25: 白板模式开启提示（一次性触发，无持续按钮态）
+      markHintEl.textContent = message.drawing
+        ? '白板模式已开启：在页面上涂抹，点「完成」生成所指。Esc 或工具条「退出」结束。'
+        : '白板模式未开启'
+      markHintEl.style.color = '#6b7280'
+      break
+    case 'DRAWING_ERROR':
+      markHintEl.textContent = message.error || '白板开启失败'
       markHintEl.style.color = '#dc2626'
       break
     case 'SESSION_CREATED':
