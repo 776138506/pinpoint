@@ -47,7 +47,11 @@ interface Harness {
 
 function setup(): Harness {
   let messageListener: MessageListener | null = null
-  const sendMessage = vi.fn(() => Promise.resolve({ ok: true }))
+  // 2026-08-25: 支持回调形式（发送路径用 sendMessage(msg, cb)），更贴近真实 runtime
+  const sendMessage = vi.fn((_msg?: unknown, cb?: (res?: unknown) => void) => {
+    if (typeof cb === 'function') cb({ ok: true })
+    return Promise.resolve({ ok: true })
+  })
   const runtime = {
     id: 'test-ext',
     onMessage: { addListener: (fn: MessageListener) => { messageListener = fn } },
@@ -280,7 +284,10 @@ describe('扩展侧区域框选（2026-08-24）', () => {
       c => (c[0] as { type?: string }).type === 'STAGE_MARK',
     )
     expect(stageCalls).toHaveLength(0)
-    expect(document.body.classList.contains('dsh-point-ext-marking')).toBe(true)
+    // 不断言共享 body 类名——存活旧实例的弹窗暂停（2026-08-25）会把类名摘掉；
+    // 改断言本实例状态：拖拽中 Esc 只取消框选，不退出标记
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marking: boolean }
+    expect(s.marking).toBe(true)
     expect(document.querySelector('.dsh-point-ext-region-rect')).toBeNull()
   })
 
@@ -819,5 +826,161 @@ describe('评论窗长截图溢出（2026-08-25：暂存/发送按钮须始终�
     const styleText = Array.from(document.querySelectorAll('style')).map(s => s.textContent ?? '').join('\n')
     expect(styleText).toContain('.dsh-point-ext-popup-shot-wrap')
     expect(styleText).toContain('max-height: calc(100vh - 16px)')
+  })
+})
+
+describe('捕获即暂停、了结即恢复（2026-08-25：评论子流程不与标记态叠加）', () => {
+  function captureDiv(h: Harness, id = 'ext-pause'): HTMLDivElement {
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const div = document.createElement('div')
+    div.id = id
+    div.textContent = 'x'
+    document.body.appendChild(div)
+    div.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    return div
+  }
+  function popupButton(text: string): HTMLButtonElement {
+    const btn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-popup button'))
+      .find(b => b.textContent === text)
+    expect(btn).toBeDefined()
+    return btn!
+  }
+  function getState(h: Harness): { marking: boolean; marks: Array<{ index: number; status: string }> } {
+    return h.fireMessage({ type: 'GET_STATE' }) as { marking: boolean; marks: Array<{ index: number; status: string }> }
+  }
+
+  it('点击捕获元素后：标记暂停、同步 background、评论窗打开', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+
+    const s = getState(h)
+    expect(s.marks).toHaveLength(1)
+    expect(s.marking).toBe(false)
+    expect(h.sendMessage).toHaveBeenCalledWith({ type: 'MARKING_STATE_SYNC', marking: false })
+    expect(document.querySelector('.dsh-point-ext-popup')).not.toBeNull()
+  })
+
+  it('暂停期间点击页面元素不产生新捕获（评论子流程独占输入）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+
+    const other = document.createElement('div')
+    other.id = 'ext-other'
+    document.body.appendChild(other)
+    other.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await flushAsync()
+
+    expect(getState(h).marks).toHaveLength(1)
+  })
+
+  it('暂存后恢复标记并同步 background', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+
+    const ta = document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!
+    ta.value = '评论内容'
+    popupButton('暂存').click()
+    await flushAsync()
+    await flushAsync()
+
+    expect(getState(h).marking).toBe(true)
+    expect(h.sendMessage).toHaveBeenCalledWith({ type: 'MARKING_STATE_SYNC', marking: true })
+    expect(document.querySelector('.dsh-point-ext-popup')).toBeNull()
+  })
+
+  it('发送后恢复标记', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+
+    const ta = document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!
+    ta.value = '评论内容'
+    popupButton('发送').click()
+    await flushAsync()
+    await flushAsync()
+
+    expect(getState(h).marking).toBe(true)
+    expect(getState(h).marks[0]!.status).toBe('sent')
+  })
+
+  it('删除草稿后恢复标记', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+
+    popupButton('删除').click()
+    await flushAsync()
+
+    expect(getState(h).marks).toHaveLength(0)
+    expect(getState(h).marking).toBe(true)
+  })
+
+  it('重开已标记元素的评论窗同样暂停（2026-08-25 用户补充：重开也要暂停）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    const div = captureDiv(h)
+    await flushAsync()
+    // 暂存 → 恢复标记
+    popupButton('暂存').click()
+    await flushAsync()
+    await flushAsync()
+    expect(getState(h).marking).toBe(true)
+
+    // 再点已标记元素 → 重开评论窗 → 再次暂停
+    div.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await flushAsync()
+
+    expect(getState(h).marking).toBe(false)
+    expect(getState(h).marks).toHaveLength(1)
+    expect(document.querySelector('.dsh-point-ext-popup')).not.toBeNull()
+  })
+
+  it('暂停中按 Esc：关弹窗（草稿删除，同关闭按钮）且不恢复标记（明确退出优先）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flushAsync()
+
+    expect(getState(h).marks).toHaveLength(0)
+    expect(getState(h).marking).toBe(false)
+    expect(document.querySelector('.dsh-point-ext-popup')).toBeNull()
+    // 没有出现恢复同步
+    const syncTrue = h.sendMessage.mock.calls.filter(
+      c => JSON.stringify(c[0]) === JSON.stringify({ type: 'MARKING_STATE_SYNC', marking: true }),
+    )
+    expect(syncTrue).toHaveLength(0)
+  })
+
+  it('标记本就关闭时打开/关闭评论窗（角标路径）：不产生意外标记态', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+    popupButton('暂存').click()
+    await flushAsync()
+    await flushAsync()
+    // 显式退出标记（Esc）
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    expect(getState(h).marking).toBe(false)
+
+    // 点角标重开评论窗 → 标记关着，无暂停可言；关闭后也不得自动恢复
+    const badge = document.querySelector<HTMLElement>('.dsh-point-ext-badge')!
+    badge.click()
+    await flushAsync()
+    expect(document.querySelector('.dsh-point-ext-popup')).not.toBeNull()
+    document.querySelector<HTMLButtonElement>('.dsh-point-ext-popup-close')!.click()
+    await flushAsync()
+    expect(getState(h).marking).toBe(false)
   })
 })

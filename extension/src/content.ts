@@ -332,6 +332,15 @@ function onKeyDown(e: KeyboardEvent): void {
     exitDrawingMode()
     return
   }
+  // 2026-08-25: 评论子流程（标记被弹窗暂停）中的 Esc = 明确放弃：与弹窗关闭按钮
+  // 同语义（草稿删除），且属显式退出——不恢复标记
+  if (e.key === 'Escape' && state.activeIndex !== null && markPauseActive) {
+    const m = state.marks.find(mk => mk.index === state.activeIndex)
+    if (m?.status === 'draft') removeMark(m.index)
+    openMark(null)
+    markPauseActive = false
+    return
+  }
   if (e.key === 'Escape' && state.marking) {
     // 2026-08-24: Esc 层级：拖拽态 > 标记态（评论窗白板已移除，无工具态）。
     if (isDragging) {
@@ -804,7 +813,32 @@ function setState(next: ContentState): void {
   repositionPopup()
 }
 
+// 2026-08-25: 捕获即暂停、了结即恢复（用户拍板）——评论窗打开期间标记输入暂停，
+// 避免「写评论时页面还处于标记态」的叠加冲突（历史上出过评论区被高亮的 bug）。
+// markPauseActive 记着「这次标记是被弹窗自动暂停的」；只有弹窗动作（暂存/发送/
+// 删除/关闭）才恢复，显式退出（Esc/快捷键/侧栏按钮）清除标记但不恢复。
+let markPauseActive = false
+
+function pauseMarking(): void {
+  if (!state.marking || markPauseActive) return
+  markPauseActive = true
+  // 不经 setMarking(false)——它会了结草稿/关弹窗，而此刻正要开弹窗
+  setState({ ...state, marking: false })
+  syncMarkingState()
+}
+
+function resumeMarking(): void {
+  if (!markPauseActive) return
+  markPauseActive = false
+  if (drawingMode) return // 白板优先：互斥语义大于恢复语义
+  setMarking(true)
+  syncMarkingState()
+}
+
 function setMarking(on: boolean): void {
+  // 2026-08-25: 显式开关（Esc/快捷键/侧栏按钮）优先于自动暂停/恢复——用户明确
+  // 操作后，不再欠「恢复」这笔账
+  markPauseActive = false
   // 2026-08-21: 退出标记态也要了结草稿（Esc/快捷键/侧栏按钮路径）——
   // 不变量「页面高亮 ⇔ 暂存区有记录」对退出路径同样成立，否则孤儿高亮长期残留
   if (!on) {
@@ -814,6 +848,11 @@ function setMarking(on: boolean): void {
   // 2026-08-25: 两模式互斥（用户实机报告画笔与标记并存冲突）——进标记退白板。
   // 所有开启路径（TOGGLE/SET/快捷键/侧栏）都汇聚到此，一处兜底
   if (on && drawingMode) exitDrawingMode()
+  // 2026-08-25: 暂停中显式开标记（快捷键/侧栏）= 了结当前弹窗并回到标记态
+  if (on && state.activeIndex !== null) {
+    settleDraft()
+    openMark(null)
+  }
   setState({ ...state, marking: on })
   if (on) {
     showHint('标记模式已开启：悬停高亮，点击元素捕获所指。按 Esc 退出。')
@@ -876,6 +915,9 @@ function clearMarks(): void {
 }
 
 function openMark(index: number | null): void {
+  // 2026-08-25: 打开评论窗（新捕获/点已标记元素重开/点角标）一律暂停标记输入——
+  // 用户补充：重开也要暂停，不要造成「以为在评论其实还在标记」的混乱
+  if (index !== null) pauseMarking()
   setState({ ...state, activeIndex: index })
 }
 
@@ -911,7 +953,13 @@ function renderBadges(): void {
       badge.textContent = String(mark.index)
       badge.addEventListener('click', (e) => {
         e.stopPropagation()
-        openMark(state.activeIndex === mark.index ? null : mark.index)
+        // 2026-08-25: 角标关弹窗也是「了结」——恢复被暂停的标记；开弹窗则经 openMark 自动暂停
+        if (state.activeIndex === mark.index) {
+          openMark(null)
+          resumeMarking()
+        } else {
+          openMark(mark.index)
+        }
       })
       layer.appendChild(badge)
     }
@@ -1123,6 +1171,7 @@ function renderPopup(): void {
     // 否则页面留孤儿高亮而暂存区无记录，再点同元素还会重复捕获
     if (mark.status === 'draft') removeMark(mark.index)
     else openMark(null)
+    resumeMarking() // 2026-08-25: 了结评论子流程，恢复被弹窗暂停的标记
   })
   header.appendChild(closeBtn)
   container.appendChild(header)
@@ -1205,6 +1254,7 @@ function renderPopup(): void {
           }
           updateMark(mark.index, { status: 'sent' })
           openMark(null)
+          resumeMarking() // 2026-08-25: 发送了结，恢复被暂停的标记
         })
       })()
     })
@@ -1225,6 +1275,7 @@ function renderPopup(): void {
           .then(() => {
             updateMark(mark.index, { comment, status: 'pending' })
             openMark(null)
+            resumeMarking() // 2026-08-25: 暂存了结，恢复被暂停的标记
           })
           .catch((err) => {
             console.error('[dsh-point-ext] stage failed:', err)
@@ -1246,6 +1297,7 @@ function renderPopup(): void {
     e.stopPropagation()
     removeMark(mark.index)
     openMark(null)
+    resumeMarking() // 2026-08-25: 删除了结，恢复被暂停的标记
   })
   actions.appendChild(delBtn)
 
