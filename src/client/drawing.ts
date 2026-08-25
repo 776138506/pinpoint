@@ -138,3 +138,121 @@ export async function composeScreenshot(screenshot: string, strokes: readonly St
     img.src = screenshot
   })
 }
+
+/* ---------- 像素级橡皮（2026-08-25：矢量切割实现） ----------
+ * 橡皮不做「整条删除」（那和撤销没区别），而是把笔画在擦除交点处切断成
+ * 子笔画——矢量模型不变，drawStrokes / composeScreenshot / 归一化管线零改动。
+ * 箭头/矩形被擦到时先转成等效折线（pen），再统一切割。
+ * ponytail: 箭头头部填充三角转成轮廓折线后视觉略有差异（空心化），
+ * 白板是快速标注场景，可接受；要完全保真需引入填充图元的切割。 */
+
+/** Distance from point (px, py) to segment (ax, ay)-(bx, by). */
+export function distToSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+  const dx = bx - ax
+  const dy = by - ay
+  const lenSq = dx * dx + dy * dy
+  if (lenSq === 0) return Math.hypot(px - ax, py - ay)
+  let t = ((px - ax) * dx + (py - ay) * dy) / lenSq
+  t = Math.max(0, Math.min(1, t))
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+}
+
+/**
+ * Expand a stroke into plain polylines: pen stays itself; arrow becomes shaft +
+ * head triangle outline (3 polylines); rect becomes its 4-edge closed polyline.
+ */
+function strokeToPolylines(stroke: Stroke): number[][] {
+  const pts = stroke.points
+  if (stroke.tool === 'pen' || pts.length < 4) return pts.length >= 4 ? [pts] : []
+  const [x1, y1, x2, y2] = pts as [number, number, number, number]
+  if (stroke.tool === 'rect') {
+    return [[x1, y1, x2, y1, x2, y2, x1, y2, x1, y1]]
+  }
+  // arrow：箭杆 + 头部三角轮廓（与 drawStrokes 的箭头几何同款）
+  const head = getArrowHead({ x: x2, y: y2 }, { x: x1, y: y1 }, LINE_WIDTH * 3)
+  return [
+    [x1, y1, x2, y2],
+    [x2, y2, head.left.x, head.left.y, head.right.x, head.right.y, x2, y2],
+  ]
+}
+
+function polylineHitsSegment(pl: number[], ex1: number, ey1: number, ex2: number, ey2: number, radius: number): boolean {
+  for (let i = 0; i + 3 < pl.length; i += 2) {
+    // 线段相交判定：采样足够密（切割采样 2px），任一端点或中点落入半径即算命中
+    const mx = (pl[i]! + pl[i + 2]!) / 2
+    const my = (pl[i + 1]! + pl[i + 3]!) / 2
+    if (
+      distToSegment(pl[i]!, pl[i + 1]!, ex1, ey1, ex2, ey2) <= radius
+      || distToSegment(mx, my, ex1, ey1, ex2, ey2) <= radius
+      || distToSegment(pl[i + 2]!, pl[i + 3]!, ex1, ey1, ex2, ey2) <= radius
+    ) return true
+  }
+  return false
+}
+
+/**
+ * Cut one polyline by the eraser capsule (segment + radius). Returns the kept
+ * runs (each ≥ 2 points). Segments are resampled at ~2px so the cut boundary
+ * follows the eraser edge instead of the coarse pen-sampling points.
+ */
+function cutPolyline(pl: number[], ex1: number, ey1: number, ex2: number, ey2: number, radius: number): number[][] {
+  // 密采样展开
+  const samples: number[] = []
+  for (let i = 0; i + 3 < pl.length; i += 2) {
+    const ax = pl[i]!
+    const ay = pl[i + 1]!
+    const bx = pl[i + 2]!
+    const by = pl[i + 3]!
+    const len = Math.hypot(bx - ax, by - ay)
+    const steps = Math.max(1, Math.ceil(len / 2))
+    for (let s = 0; s < steps; s++) {
+      samples.push(ax + ((bx - ax) * s) / steps, ay + ((by - ay) * s) / steps)
+    }
+  }
+  if (pl.length >= 2) samples.push(pl[pl.length - 2]!, pl[pl.length - 1]!)
+  // 按「是否落入橡皮」切成保留段
+  const runs: number[][] = []
+  let run: number[] = []
+  for (let i = 0; i < samples.length; i += 2) {
+    const erased = distToSegment(samples[i]!, samples[i + 1]!, ex1, ey1, ex2, ey2) <= radius
+    if (erased) {
+      if (run.length >= 4) runs.push(run)
+      run = []
+    } else {
+      run.push(samples[i]!, samples[i + 1]!)
+    }
+  }
+  if (run.length >= 4) runs.push(run)
+  return runs
+}
+
+/**
+ * Erase part of `strokes` along the segment (ex1, ey1)-(ex2, ey2) with the given
+ * radius. Untouched strokes keep their identity (same object). Returns
+ * `{ strokes, changed }` so callers can skip redundant redraws.
+ */
+export function eraseStrokes(
+  strokes: readonly Stroke[],
+  ex1: number,
+  ey1: number,
+  ex2: number,
+  ey2: number,
+  radius: number,
+): { strokes: Stroke[]; changed: boolean } {
+  const out: Stroke[] = []
+  let changed = false
+  for (const stroke of strokes) {
+    const polylines = strokeToPolylines(stroke)
+    if (!polylines.some(pl => polylineHitsSegment(pl, ex1, ey1, ex2, ey2, radius))) {
+      out.push(stroke)
+      continue
+    }
+    changed = true
+    for (const pl of polylines) {
+      for (const run of cutPolyline(pl, ex1, ey1, ex2, ey2, radius)) {
+        out.push({ tool: 'pen', points: run })
+      }
+    }
+  }
+  return { strokes: out, changed }
+}

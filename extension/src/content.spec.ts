@@ -31,7 +31,9 @@ vi.mock('html2canvas', () => ({
   }),
 }))
 
-vi.mock('../../src/client/drawing.ts', () => ({
+vi.mock('../../src/client/drawing.ts', async (importOriginal) => ({
+  // 2026-08-25: 部分 mock——只替换合成/绘制，eraseStrokes 等几何纯函数用真实实现
+  ...(await importOriginal<typeof import('../../src/client/drawing.ts')>()),
   composeScreenshot: vi.fn(async (_screenshot: string, strokes: unknown[]) =>
     Array.isArray(strokes) && strokes.length > 0 ? 'composed-screenshot' : null),
   drawStrokes: vi.fn(),
@@ -578,6 +580,36 @@ describe('扩展侧页面白板模式（2026-08-25：画笔涂抹 → 截图发 
     )
     expect(stageCalls).toHaveLength(1)
     expect((stageCalls[0]![0] as { mark: { screenshot: string } }).mark.screenshot).toBe('composed-screenshot')
+  })
+
+  it('橡皮擦过笔画中段：笔画被切成两段而非整条删除（2026-08-25 用户拍板：整条删=撤销）', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    vi.mocked(composeScreenshot).mockClear()
+    const h = setup()
+    await import('./content.ts')
+    const canvas = startBoard(h)
+
+    // 画一条水平长线
+    drawPenStroke(canvas, [100, 100], [300, 100])
+    // 切橡皮工具，在 x=200 处竖着擦一刀
+    const eraserBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '橡皮')
+    expect(eraserBtn).toBeDefined()
+    eraserBtn!.click()
+    drawPenStroke(canvas, [200, 90], [200, 110])
+
+    // 完成 + 发送：合成管线收到的应是两段 pen 笔画（中段被切掉）
+    finishButton().click()
+    await flushAsync()
+    await flushAsync()
+    const sendBtn = document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-popup-btn.primary')[0]!
+    sendBtn.click()
+    await flushAsync()
+
+    expect(vi.mocked(composeScreenshot)).toHaveBeenCalledTimes(1)
+    const strokes = vi.mocked(composeScreenshot).mock.calls[0]![1] as Array<{ tool: string; points: number[] }>
+    expect(strokes).toHaveLength(2)
+    for (const s of strokes) expect(s.tool).toBe('pen')
   })
 
   it('空白板点完成：提示且不产出 mark，白板保持', async () => {

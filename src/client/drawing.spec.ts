@@ -9,7 +9,8 @@
  */
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { composeScreenshot, drawStrokes, getArrowHead } from './drawing.ts'
+import { composeScreenshot, drawStrokes, eraseStrokes, getArrowHead } from './drawing.ts'
+import type { Stroke } from './drawing.ts'
 
 const FAKE_SCREENSHOT = 'data:image/png;base64,fake'
 
@@ -146,5 +147,63 @@ describe('composeScreenshot', () => {
     instance?.onerror?.()
     const result = await promise
     expect(result).toBeNull()
+  })
+})
+
+describe('eraseStrokes 像素级橡皮（2026-08-25：矢量切割，不整条删）', () => {
+  const PEN: Stroke = { tool: 'pen', points: [0, 50, 100, 50] } // 水平线
+
+  it('擦中间一段：一条笔画切成两条，其余部分保留', () => {
+    const { strokes, changed } = eraseStrokes([PEN], 50, 40, 50, 60, 10)
+    expect(changed).toBe(true)
+    expect(strokes).toHaveLength(2)
+    for (const s of strokes) expect(s.tool).toBe('pen')
+    // 左段在 x≈40 以内，右段从 x≈60 起
+    const xs = strokes.map(s => s.points.filter((_, i) => i % 2 === 0))
+    expect(Math.max(...xs[0]!)).toBeLessThan(50)
+    expect(Math.min(...xs[1]!)).toBeGreaterThan(50)
+  })
+
+  it('整段擦除：笔画被删干净', () => {
+    const { strokes } = eraseStrokes([PEN], 0, 50, 100, 50, 10)
+    expect(strokes).toHaveLength(0)
+  })
+
+  it('未命中：笔画原样保留（同一对象引用，不重画）', () => {
+    const { strokes, changed } = eraseStrokes([PEN], 0, 200, 100, 200, 10)
+    expect(changed).toBe(false)
+    expect(strokes[0]).toBe(PEN)
+  })
+
+  it('矩形被擦到：先转等效折线再切割，结果全是 pen', () => {
+    const rect: Stroke = { tool: 'rect', points: [10, 10, 90, 90] }
+    const { strokes, changed } = eraseStrokes([rect], 50, 5, 50, 20, 8) // 擦上边
+    expect(changed).toBe(true)
+    expect(strokes.length).toBeGreaterThan(0)
+    for (const s of strokes) expect(s.tool).toBe('pen')
+    // 上边（y=10）被擦带（x∈[42,58]，半径 8）内不得有保留点
+    for (const s of strokes) {
+      for (let i = 0; i < s.points.length; i += 2) {
+        const inErasedBand = Math.abs(s.points[i + 1]! - 10) < 3 && s.points[i]! > 44 && s.points[i]! < 56
+        expect(inErasedBand).toBe(false)
+      }
+    }
+  })
+
+  it('箭头被擦到：箭杆与头部轮廓各自独立切割', () => {
+    const arrow: Stroke = { tool: 'arrow', points: [0, 0, 100, 0] }
+    const { strokes, changed } = eraseStrokes([arrow], 50, -10, 50, 10, 8) // 擦箭杆中段
+    expect(changed).toBe(true)
+    for (const s of strokes) expect(s.tool).toBe('pen')
+    // 箭杆被切成两段 + 头部三角轮廓保留（未被擦到）
+    const hasHeadPart = strokes.some(s => s.points.some((v, i) => i % 2 === 0 && v > 85))
+    expect(hasHeadPart).toBe(true)
+  })
+
+  it('多笔画混合：只切命中的，未命中原样', () => {
+    const other: Stroke = { tool: 'pen', points: [0, 500, 100, 500] }
+    const { strokes } = eraseStrokes([PEN, other], 50, 40, 50, 60, 10)
+    expect(strokes.filter(s => s === other)).toHaveLength(1)
+    expect(strokes.length).toBe(3) // PEN 切成 2 + other 原样
   })
 })

@@ -11,7 +11,7 @@
 import html2canvas from 'html2canvas'
 import { cloneForScreenshot, codeLocationFor, cssPath, detectExternalImages, documentRectOf, snippet, textFragmentFor, visibleText, xpathFor } from '../../src/client/mark-utils.ts'
 import { formatMarkText } from '../../src/client/util.ts'
-import { composeScreenshot, drawStrokes } from '../../src/client/drawing.ts'
+import { composeScreenshot, drawStrokes, eraseStrokes } from '../../src/client/drawing.ts'
 import type { DrawTool, Stroke } from '../../src/client/drawing.ts'
 import { BUILTIN_SHORTCUT, comboFromEvent } from './shortcut.ts'
 import { DEFAULT_SETTINGS, loadSettings, onSettingsChanged, type ExtSettings } from './settings.ts'
@@ -424,7 +424,13 @@ let boardCtx: CanvasRenderingContext2D | null = null
 let boardToolbar: HTMLElement | null = null
 let boardStrokes: Stroke[] = [] // 文档坐标（px，非归一化）
 let boardActive: Stroke | null = null
-let boardTool: DrawTool = 'pen'
+// 2026-08-25: 橡皮是白板工具但不是笔画类型——擦过的笔画在交点处被切成子笔画
+// （像素级橡皮，矢量切割实现），落库的只有 pen/arrow/rect 三种
+type BoardTool = DrawTool | 'eraser'
+let boardTool: BoardTool = 'pen'
+let boardErasing = false
+let boardLastErase: { x: number; y: number } | null = null
+const ERASE_RADIUS = 10 // px，文档坐标；ponytail: 固定半径，要做粗细档位再进设置
 let boardAnchors: ScrollAnchor[] = [] // 首笔落点处元素的内层滚动锚点
 
 function boardDelta(): { dx: number; dy: number } {
@@ -498,11 +504,33 @@ function onBoardDown(e: MouseEvent): void {
     if (under !== null) boardAnchors = collectScrollAnchors(under)
   }
   const p = boardPoint(e)
+  if (boardTool === 'eraser') {
+    boardErasing = true
+    boardLastErase = p
+    applyErase(p.x, p.y, p.x, p.y)
+    return
+  }
   boardActive = { tool: boardTool, points: [p.x, p.y, p.x, p.y] }
   scheduleBoardRedraw()
 }
 
+// 橡皮沿路径切割笔画：擦过哪段切哪段，不整条删（整条删 = 撤销的重复功能）
+function applyErase(ex1: number, ey1: number, ex2: number, ey2: number): void {
+  const { strokes, changed } = eraseStrokes(boardStrokes, ex1, ey1, ex2, ey2, ERASE_RADIUS)
+  if (!changed) return
+  boardStrokes = strokes
+  scheduleBoardRedraw()
+}
+
 function onBoardMove(e: MouseEvent): void {
+  if (boardErasing) {
+    e.preventDefault()
+    const p = boardPoint(e)
+    const last = boardLastErase ?? p
+    applyErase(last.x, last.y, p.x, p.y)
+    boardLastErase = p
+    return
+  }
   if (boardActive === null) return
   e.preventDefault()
   const p = boardPoint(e)
@@ -522,6 +550,15 @@ function onBoardMove(e: MouseEvent): void {
 }
 
 function onBoardUp(e: MouseEvent): void {
+  if (boardErasing) {
+    e.preventDefault()
+    const p = boardPoint(e)
+    const last = boardLastErase ?? p
+    applyErase(last.x, last.y, p.x, p.y)
+    boardErasing = false
+    boardLastErase = null
+    return
+  }
   if (boardActive === null) return
   e.preventDefault()
   const p = boardPoint(e)
@@ -593,6 +630,8 @@ function enterDrawingMode(): void {
   drawingMode = true
   boardStrokes = []
   boardActive = null
+  boardErasing = false
+  boardLastErase = null
   boardAnchors = []
   boardTool = 'pen'
 
@@ -607,10 +646,11 @@ function enterDrawingMode(): void {
 
   boardToolbar = document.createElement('div')
   boardToolbar.className = 'dsh-point-ext-board-toolbar'
-  const tools: { tool: DrawTool; label: string }[] = [
+  const tools: { tool: BoardTool; label: string }[] = [
     { tool: 'pen', label: '画笔' },
     { tool: 'arrow', label: '箭头' },
     { tool: 'rect', label: '矩形' },
+    { tool: 'eraser', label: '橡皮' },
   ]
   for (const t of tools) {
     const btn = document.createElement('button')
@@ -669,6 +709,8 @@ function exitDrawingMode(): void {
   drawingMode = false
   boardStrokes = []
   boardActive = null
+  boardErasing = false
+  boardLastErase = null
   boardAnchors = []
   if (boardCanvas !== null) { boardCanvas.remove(); boardCanvas = null }
   boardCtx = null
