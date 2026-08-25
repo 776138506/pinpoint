@@ -164,18 +164,26 @@ function highlight(el: Element): void {
 function unhighlight(el: Element): void {
   if (!el || el.nodeType !== 1) return
   if (!(el instanceof HTMLElement)) return
-  const rec = el as HTMLElement & { __dshPointExtOrigOutline?: string }
+  const rec = el as HTMLElement & { __dshPointExtOrigOutline?: string; __dshPointExtOrigOutlineOffset?: string }
   if ((el as unknown as Record<string, unknown>)[KEPT_FLAG]) {
-    delete rec.__dshPointExtOrigOutline
+    // 2026-08-25: KEPT 分支禁止删 __dshPointExtOrigOutline——它是「扩展动手前页面
+    // 自己的 outline」，生命周期必须覆盖整个 KEPT 期间。此前这里删掉它，下一次
+    // renderBadges 重跑时会把 KEPT 蓝框当成原始样式重新存进 orig，releaseElement
+    // 再把高亮「还原」成高亮——×关闭后高亮永不消失（实机复现，hover→点击路径）
     rec.style.outline = KEPT_OUTLINE
     rec.style.outlineOffset = '1px'
     return
   }
   if (rec.__dshPointExtOrigOutline !== undefined) {
+    // 2026-08-25: outlineOffset 与 outline 对称还原——highlight 存了两个，
+    // 这里只还 outline 会把 '1px' 垃圾留在元素内联样式上（同类快照污染）
     rec.style.outline = rec.__dshPointExtOrigOutline
+    rec.style.outlineOffset = rec.__dshPointExtOrigOutlineOffset ?? ''
     delete rec.__dshPointExtOrigOutline
+    delete rec.__dshPointExtOrigOutlineOffset
   } else {
     rec.style.outline = ''
+    rec.style.outlineOffset = ''
   }
 }
 
@@ -189,6 +197,15 @@ function onMouseOver(e: MouseEvent): void {
   // 2026-08-20: 扩展重载后旧实例的 DOM 监听仍挂在页面上，上下文已失效（chrome.runtime.id 为空），
   // 旧实例必须静默，否则与按需注入的新实例双重触发
   if (!chrome.runtime?.id) return
+  // 2026-08-25: 鼠标在窗口外松开时 mouseup 永远不到达，isDragging 会卡死
+  // （后续悬停高亮全部消失、选区矩形残留）——复归守护：悬停到达且按键已
+  // 松开 = 拖拽实际已结束，就地复位。用户操作不像机器人那么精准，凡依赖
+  // 「事件必然成对到达」的状态都要有自愈路径
+  if (isDragging && e.buttons === 0) {
+    isDragging = false
+    if (dragRectEl !== null) { dragRectEl.remove(); dragRectEl = null }
+    dragScrollAnchors = []
+  }
   if (!state.marking) return
   // 2026-08-24: 拖拽期间不画悬停高亮，避免选区矩形与 hover outline 叠加。
   if (isDragging) return
@@ -309,6 +326,14 @@ function onClick(e: MouseEvent): void {
     // 监听器（用户实机报告点链接直接跳转），suppress 路径同样要拦。
     // 注意此分支不能要求 state.marking——框选完成即暂停标记（弹窗打开），
     // 紧随其后的 click 到达时标记已是暂停态，不拦就跳转了
+    e.preventDefault()
+    e.stopPropagation()
+    return
+  }
+  // 2026-08-25: 评论窗开着（标记被弹窗暂停）时页面交互整体屏蔽——用户注意力在
+  // 评论上，此时点到链接/按钮不该触发页面行为（实机报告：写评论时点穿跳转到
+  // 别的页面）。自身 UI 已在上面放行；屏蔽只拦行为、不产生新捕获。
+  if (state.activeIndex !== null) {
     e.preventDefault()
     e.stopPropagation()
     return
@@ -984,6 +1009,9 @@ function renderBadges(): void {
         e.stopPropagation()
         // 2026-08-25: 角标关弹窗也是「了结」——恢复被暂停的标记；开弹窗则经 openMark 自动暂停
         if (state.activeIndex === mark.index) {
+          // 2026-08-25: 角标关闭与 ×/Esc 同语义——先了结草稿（有评论暂存、无评论
+          // 撤销），否则这条路径漏 settleDraft，留下「高亮还在、暂存区没有」的孤儿标记
+          settleDraft()
           openMark(null)
           resumeMarking()
         } else {

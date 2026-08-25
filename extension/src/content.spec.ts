@@ -231,6 +231,34 @@ describe('扩展侧区域框选（2026-08-24）', () => {
     expect(s.marks[0]!.status).toBe('draft')
   })
 
+  it('窗口外松开鼠标（mouseup 丢失）：悬停时按键已松开则自愈复位（2026-08-25：用户操作不像机器人精准）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const target = document.createElement('div')
+    target.style.width = '500px'
+    target.style.height = '500px'
+    document.body.appendChild(target)
+
+    // 拖拽开始（mousedown+mousemove），但没有 mouseup——用户在窗口外松开了鼠标
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 10, clientY: 20 },
+      { type: 'mousemove', clientX: 40, clientY: 60 },
+    ])
+    expect(document.querySelector('.dsh-point-ext-region-rect')).not.toBeNull()
+
+    // 下一个悬停事件（按键已松开，buttons=0）触发自愈：拖拽态复位、选区矩形回收
+    const other = document.createElement('div')
+    other.id = 'ext-after-stuck'
+    other.textContent = 'y'
+    document.body.appendChild(other)
+    other.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, buttons: 0 }))
+
+    expect(document.querySelector('.dsh-point-ext-region-rect')).toBeNull()
+    // 复位后悬停高亮恢复工作（卡死时这里不会有高亮）
+    expect(other.style.outline).toBe('2px solid #ff2d55')
+  })
+
   it('拖拽 ≤ 6px 走点击元素捕获', async () => {
     const h = setup()
     await import('./content.ts')
@@ -971,13 +999,21 @@ describe('捕获即暂停、了结即恢复（2026-08-25：评论子流程不与
   it('暂停中按 Esc（未输入评论）：放弃该标记，不恢复标记', async () => {
     const h = setup()
     await import('./content.ts')
-    captureDiv(h)
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const div = document.createElement('div')
+    div.id = 'ext-esc-hl'
+    div.textContent = 'x'
+    document.body.appendChild(div)
+    // 同族全入口覆盖：先悬停再点击（hover 是 orig 污染的触发前提）
+    div.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
+    div.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
     await flushAsync()
 
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     await flushAsync()
 
     expect(getState(h).marks).toHaveLength(0)
+    expect(div.style.outline).toBe('') // Esc 路径同样不许残留高亮
     expect(getState(h).marking).toBe(false)
     expect(document.querySelector('.dsh-point-ext-popup')).toBeNull()
     // 没有出现恢复同步
@@ -1025,6 +1061,30 @@ describe('捕获即暂停、了结即恢复（2026-08-25：评论子流程不与
     expect(document.querySelector('.dsh-point-ext-popup')).toBeNull()
   })
 
+  it('×关闭（未输入评论）：元素 outline 高亮同步回收（2026-08-25 实机复现：高亮残留）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const div = document.createElement('div')
+    div.id = 'ext-xhl'
+    div.textContent = 'x'
+    document.body.appendChild(div)
+
+    // 复刻真实操作序列：先悬停（hover 高亮）→ 点击捕获 → 不写评论直接点 ×
+    div.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
+    div.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await flushAsync()
+    expect(div.style.outline).not.toBe('') // 捕获后 KEPT 高亮在
+    expect(document.querySelector('.dsh-point-ext-popup')).not.toBeNull()
+
+    document.querySelector<HTMLButtonElement>('.dsh-point-ext-popup-close')!.click()
+    await flushAsync()
+
+    expect(getState(h).marks).toHaveLength(0)
+    expect(div.style.outline).toBe('') // 高亮必须随标记一起消失
+    expect((div as unknown as Record<string, unknown>)['__dshPointExtKept']).toBeUndefined()
+  })
+
   it('标记本就关闭时打开/关闭评论窗（角标路径）：不产生意外标记态', async () => {
     const h = setup()
     await import('./content.ts')
@@ -1045,6 +1105,54 @@ describe('捕获即暂停、了结即恢复（2026-08-25：评论子流程不与
     document.querySelector<HTMLButtonElement>('.dsh-point-ext-popup-close')!.click()
     await flushAsync()
     expect(getState(h).marking).toBe(false)
+  })
+
+  it('角标关闭（未输入评论）：撤销该标记，不留孤儿高亮（2026-08-25 实机报告）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const div = document.createElement('div')
+    div.id = 'ext-badge-hl'
+    div.textContent = 'x'
+    document.body.appendChild(div)
+    // 与 × 测试同样先悬停再点击——hover 是 orig 污染的触发前提，必须覆盖
+    div.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
+    div.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await flushAsync()
+
+    // 评论窗打开（标记被暂停），直接点角标关窗，不写任何评论
+    const badge = document.querySelector<HTMLElement>('.dsh-point-ext-badge')!
+    badge.click()
+    await flushAsync()
+
+    expect(getState(h).marks).toHaveLength(0)
+    expect(div.style.outline).toBe('') // 高亮随评论窗一起回收
+    expect(getState(h).marking).toBe(true) // 了结后恢复被暂停的标记
+    expect(document.querySelector('.dsh-point-ext-popup')).toBeNull()
+  })
+
+  it('评论窗打开期间点击页面链接：拦截导航，页面监听器收不到（2026-08-25 实机报告点穿跳转）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    captureDiv(h)
+    await flushAsync()
+    expect(document.querySelector('.dsh-point-ext-popup')).not.toBeNull()
+
+    const a = document.createElement('a')
+    a.href = 'https://example.com/'
+    a.textContent = 'link'
+    document.body.appendChild(a)
+    const pageListener = vi.fn()
+    a.addEventListener('click', pageListener)
+
+    const evt = new MouseEvent('click', { bubbles: true, cancelable: true })
+    a.dispatchEvent(evt)
+    await flushAsync()
+
+    expect(evt.defaultPrevented).toBe(true)
+    expect(pageListener).not.toHaveBeenCalled()
+    // 屏蔽只是拦行为，不产生新捕获
+    expect(getState(h).marks).toHaveLength(1)
   })
 })
 
