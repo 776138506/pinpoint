@@ -1047,3 +1047,98 @@ describe('捕获即暂停、了结即恢复（2026-08-25：评论子流程不与
     expect(getState(h).marking).toBe(false)
   })
 })
+
+describe('点击即开评论窗（2026-08-25：截图异步回填，用户要求 ms 级响应）', () => {
+  // 让 html2canvas 变成可控的未决承诺：截图完成前验证评论窗已开
+  function deferredH2c(): { resolve: () => void } {
+    let resolveFn: () => void = () => {}
+    vi.mocked(html2canvas).mockImplementationOnce(
+      () => new Promise((res) => {
+        resolveFn = () => res({ toDataURL: () => FAKE_SCREENSHOT, width: 100, height: 100 })
+      }) as ReturnType<typeof html2canvas>,
+    )
+    return { resolve: () => resolveFn() }
+  }
+
+  it('截图未完成时评论窗已打开（标记+弹窗不等待 html2canvas）', async () => {
+    const d = deferredH2c()
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const div = document.createElement('div')
+    div.id = 'ext-fast'
+    div.textContent = 'fast'
+    document.body.appendChild(div)
+
+    div.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await flushAsync()
+
+    // 截图还挂着，评论窗已开、mark 已建
+    expect(document.querySelector('.dsh-point-ext-popup')).not.toBeNull()
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ screenshotLen: number }> }
+    expect(s.marks).toHaveLength(1)
+    expect(s.marks[0]!.screenshotLen).toBe(0)
+    // 有「生成中」反馈
+    expect(document.querySelector('.dsh-point-ext-popup')!.textContent).toContain('截图生成中')
+
+    // 截图完成 → 回填进弹窗
+    d.resolve()
+    await flushAsync()
+    await flushAsync()
+    expect(document.querySelector('.dsh-point-ext-popup-shot')).not.toBeNull()
+  })
+
+  it('暂存等待在途截图：截图未完成不产出 STAGE_MARK，完成后带截图暂存', async () => {
+    const d = deferredH2c()
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const div = document.createElement('div')
+    div.id = 'ext-fast2'
+    div.textContent = 'fast'
+    document.body.appendChild(div)
+    div.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await flushAsync()
+
+    const ta = document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!
+    ta.value = '评论'
+    Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-popup button'))
+      .find(b => b.textContent === '暂存')!.click()
+    await flushAsync()
+
+    // 截图未决：尚未暂存
+    expect(h.sendMessage.mock.calls.filter(c => (c[0] as { type?: string }).type === 'STAGE_MARK')).toHaveLength(0)
+
+    d.resolve()
+    await flushAsync()
+    await flushAsync()
+    await flushAsync()
+
+    const stageCalls = h.sendMessage.mock.calls.filter(c => (c[0] as { type?: string }).type === 'STAGE_MARK')
+    expect(stageCalls).toHaveLength(1)
+    expect((stageCalls[0]![0] as { mark: { screenshot: string } }).mark.screenshot).toBe(FAKE_SCREENSHOT)
+  })
+
+  it('截图回填重渲染不清空已输入的评论', async () => {
+    const d = deferredH2c()
+    const h = setup()
+    await import('./content.ts')
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const div = document.createElement('div')
+    div.id = 'ext-fast3'
+    div.textContent = 'fast'
+    document.body.appendChild(div)
+    div.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await flushAsync()
+
+    const ta = document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!
+    ta.value = '正在输入的评论'
+
+    d.resolve()
+    await flushAsync()
+    await flushAsync()
+
+    expect(document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!.value).toBe('正在输入的评论')
+    expect(document.querySelector('.dsh-point-ext-popup-shot')).not.toBeNull()
+  })
+})

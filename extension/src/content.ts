@@ -40,6 +40,9 @@ let popupLayer: HTMLDivElement | null = null
 let hoveredEl: Element | null = null
 let rafPending = false
 let popupBusy = false
+// 2026-08-25: 记录弹窗当前渲染的是哪个标记——截图回填触发的重渲染要保住
+// 用户正在输入的评论（只对同一标记且不 busy 时恢复）
+let popupRenderedIndex: number | null = null
 let lastHintAt = 0
 let captureInFlight = false
 
@@ -98,6 +101,9 @@ function regionDelta(index: number): { dx: number; dy: number } {
 // screenshot at send/stage time. ponytail: not persisted (lost on refresh).
 // 2026-08-25: 唯一生产者=页面白板（finishBoard）；评论窗白板已移除
 const strokeMap = new Map<number, Stroke[]>()
+// 2026-08-25: 在途截图（用户要求点击→评论窗 ms 级）——评论窗先开，html2canvas
+// 异步回填；暂存/发送/了结草稿时若截图未决则等它，保证暂存区必有图
+const pendingShots = new Map<number, Promise<void>>()
 
 // 2026-08-20: 页面内自定义快捷键（侧栏设置区配置，chrome.storage 共享）。
 // 等于内置 Alt+Shift+M 时不处理——该组合由 manifest commands 全局接管，避免双重切换
@@ -289,7 +295,6 @@ function onMouseUp(e: MouseEvent): void {
 
 function onClick(e: MouseEvent): void {
   if (!chrome.runtime?.id) return // 同上：失效旧实例静默
-  if (!state.marking) return
   const el = e.target as Element
   if (!el || el.nodeType !== 1) return
   // 2026-08-25: 自身 UI 的点击永不拦截、也不消耗 suppressClick——必须在 suppressClick
@@ -301,11 +306,14 @@ function onClick(e: MouseEvent): void {
   if (suppressClick) {
     suppressClick = false
     // 2026-08-25: 拖拽起于链接/按钮时，mouseup 后的 click 仍会触发导航与页面
-    // 监听器（用户实机报告点链接直接跳转），suppress 路径同样要拦
+    // 监听器（用户实机报告点链接直接跳转），suppress 路径同样要拦。
+    // 注意此分支不能要求 state.marking——框选完成即暂停标记（弹窗打开），
+    // 紧随其后的 click 到达时标记已是暂停态，不拦就跳转了
     e.preventDefault()
     e.stopPropagation()
     return
   }
+  if (!state.marking) return
   // 2026-08-25: 标记态点击 = 捕获所指，不是页面交互——拦截链接默认导航与页面
   // 自身的 click 处理器（capture 阶段 stopPropagation，页面监听器收不到）
   e.preventDefault()
@@ -655,10 +663,19 @@ function settleDraft(): void {
     : null
   const comment = (textarea?.value.trim() || draft.comment?.trim()) ?? ''
   if (comment) {
-    const staged: Mark = { ...draft, comment, status: 'pending' }
     updateMark(draft.index, { comment, status: 'pending' })
-    chrome.runtime.sendMessage({ type: 'STAGE_MARK', mark: staged, sendNow: false })
-      .catch((e) => console.error('[dsh-point-ext] auto-stage failed:', e))
+    // 2026-08-25: 截图异步回填后，暂存必须带上截图——在途截图未决时等它
+    // （用户要求暂存区可见截图）；标记若在等待期间被删除（侧栏清空等）则不再暂存
+    const doStage = (): void => {
+      const fresh = state.marks.find(m => m.index === draft.index)
+      if (!fresh) return
+      const staged: Mark = { ...fresh, comment, status: 'pending' }
+      chrome.runtime.sendMessage({ type: 'STAGE_MARK', mark: staged, sendNow: false })
+        .catch((e) => console.error('[dsh-point-ext] auto-stage failed:', e))
+    }
+    const pending = pendingShots.get(draft.index)
+    if (pending) void pending.then(doStage)
+    else doStage()
   } else {
     removeMark(draft.index)
   }
@@ -692,29 +709,36 @@ async function captureElement(el: Element): Promise<void> {
     code: codeLocationFor(el),
   }
 
-  const prepared = cloneForScreenshot(el)
-  try {
-    // 2026-08-21: html2canvas 无内建超时——截图挂起会让 captureInFlight 永真、
-    // 标记功能静默锁死（五问审视：留白/容错缺口）。超时后降级为纯文本所指
-    const canvas = await Promise.race([
-      html2canvas(prepared.clone, {
-        backgroundColor: '#ffffff',
-        scale: 1,
-        logging: false,
-        useCORS: true,
-        allowTaint: false,
-      }),
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`截图超时（${extSettings.screenshotTimeoutMs}ms）`)), extSettings.screenshotTimeoutMs)),
-    ])
-    mark.screenshot = canvas.toDataURL('image/png')
-  } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e)
-    console.error('[dsh-point-ext] screenshot failed:', e)
-    mark.screenshotError = reason
-    showToast(`截图失败：${reason}。仍可发送纯文本所指。`)
-  } finally {
-    prepared.cleanup()
-  }
+  // 2026-08-25: 先开评论窗再截图（用户要求 ms 级响应）——html2canvas 是重活，
+  // 在途承诺挂 pendingShots，完成后 updateMark 回填；暂存/发送会等它。
+  // pendingShots 必须先于 addMark/openMark 挂上——openMark 同步渲染弹窗，
+  // 「截图生成中」反馈依赖这个标记位
+  pendingShots.set(mark.index, (async () => {
+    const prepared = cloneForScreenshot(el)
+    try {
+      // 2026-08-21: html2canvas 无内建超时——截图挂起会让 captureInFlight 永真、
+      // 标记功能静默锁死（五问审视：留白/容错缺口）。超时后降级为纯文本所指
+      const canvas = await Promise.race([
+        html2canvas(prepared.clone, {
+          backgroundColor: '#ffffff',
+          scale: 1,
+          logging: false,
+          useCORS: true,
+          allowTaint: false,
+        }),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`截图超时（${extSettings.screenshotTimeoutMs}ms）`)), extSettings.screenshotTimeoutMs)),
+      ])
+      updateMark(mark.index, { screenshot: canvas.toDataURL('image/png') })
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e)
+      console.error('[dsh-point-ext] screenshot failed:', e)
+      updateMark(mark.index, { screenshotError: reason })
+      showToast(`截图失败：${reason}。仍可发送纯文本所指。`)
+    } finally {
+      prepared.cleanup()
+      pendingShots.delete(mark.index)
+    }
+  })())
 
   addMark(mark)
   openMark(mark.index)
@@ -757,42 +781,48 @@ async function captureRegionInner(rect: { x: number; y: number; width: number; h
   // 挂晚了 popup 白板画布读不到本次笔迹
   if (strokes !== undefined && strokes.length > 0) strokeMap.set(mark.index, strokes)
 
-  try {
-    const de = document.documentElement
-    // 2026-08-25: 视口内区域走快速路径——克隆窗口保持视口大小、裁剪坐标换算成
-    // 视口坐标。布局/媒体查询与用户当前所见一致（更保真），且免去整文档渲染
-    // （长页面截图卡顿大头）。只有超出视口的区域才撑整文档窗口（慢速兜底）。
-    const sx = window.scrollX
-    const sy = window.scrollY
-    const inViewport = rect.x >= sx && rect.y >= sy
-      && rect.x + rect.width <= sx + window.innerWidth
-      && rect.y + rect.height <= sy + window.innerHeight
-    const startedAt = performance.now()
-    const canvas = await Promise.race([
-      html2canvas(document.documentElement, {
-        backgroundColor: '#ffffff',
-        scale: 1,
-        logging: false,
-        useCORS: true,
-        allowTaint: false,
-        x: inViewport ? rect.x - sx : rect.x,
-        y: inViewport ? rect.y - sy : rect.y,
-        width: rect.width,
-        height: rect.height,
-        windowWidth: !inViewport && de.scrollWidth > 0 ? de.scrollWidth : undefined,
-        windowHeight: !inViewport && de.scrollHeight > 0 ? de.scrollHeight : undefined,
-      }),
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`截图超时（${extSettings.screenshotTimeoutMs}ms）`)), extSettings.screenshotTimeoutMs)),
-    ])
-    // 实机性能观测点：卡顿时让用户开控制台看这个耗时即可定位是哪个路径慢
-    console.debug(`[dsh-point-ext] region screenshot took ${Math.round(performance.now() - startedAt)}ms (${inViewport ? 'viewport' : 'full-document'} path)`)
-    mark.screenshot = canvas.toDataURL('image/png')
-  } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e)
-    console.error('[dsh-point-ext] region screenshot failed:', e)
-    mark.screenshotError = reason
-    showToast(`截图失败：${reason}。仍可发送纯文本所指。`)
-  }
+  // 2026-08-25: 先开评论窗再截图（用户要求 ms 级响应）——同 captureElement；
+  // pendingShots 先于 addMark/openMark 挂上，弹窗首帧就能显示「截图生成中」
+  pendingShots.set(mark.index, (async () => {
+    try {
+      const de = document.documentElement
+      // 2026-08-25: 视口内区域走快速路径——克隆窗口保持视口大小、裁剪坐标换算成
+      // 视口坐标。布局/媒体查询与用户当前所见一致（更保真），且免去整文档渲染
+      // （长页面截图卡顿大头）。只有超出视口的区域才撑整文档窗口（慢速兜底）。
+      const sx = window.scrollX
+      const sy = window.scrollY
+      const inViewport = rect.x >= sx && rect.y >= sy
+        && rect.x + rect.width <= sx + window.innerWidth
+        && rect.y + rect.height <= sy + window.innerHeight
+      const startedAt = performance.now()
+      const canvas = await Promise.race([
+        html2canvas(document.documentElement, {
+          backgroundColor: '#ffffff',
+          scale: 1,
+          logging: false,
+          useCORS: true,
+          allowTaint: false,
+          x: inViewport ? rect.x - sx : rect.x,
+          y: inViewport ? rect.y - sy : rect.y,
+          width: rect.width,
+          height: rect.height,
+          windowWidth: !inViewport && de.scrollWidth > 0 ? de.scrollWidth : undefined,
+          windowHeight: !inViewport && de.scrollHeight > 0 ? de.scrollHeight : undefined,
+        }),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`截图超时（${extSettings.screenshotTimeoutMs}ms）`)), extSettings.screenshotTimeoutMs)),
+      ])
+      // 实机性能观测点：卡顿时让用户开控制台看这个耗时即可定位是哪个路径慢
+      console.debug(`[dsh-point-ext] region screenshot took ${Math.round(performance.now() - startedAt)}ms (${inViewport ? 'viewport' : 'full-document'} path)`)
+      updateMark(mark.index, { screenshot: canvas.toDataURL('image/png') })
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e)
+      console.error('[dsh-point-ext] region screenshot failed:', e)
+      updateMark(mark.index, { screenshotError: reason })
+      showToast(`截图失败：${reason}。仍可发送纯文本所指。`)
+    } finally {
+      pendingShots.delete(mark.index)
+    }
+  })())
 
   addMark(mark)
   openMark(mark.index)
@@ -1136,6 +1166,13 @@ async function composeLocalMark(mark: Mark): Promise<Mark> {
 
 /* ---------- popup ---------- */
 
+// 2026-08-25: 在途截图未决时先等它再读 mark（暂存/发送共用），返回最新 mark
+async function awaitPendingShot(index: number): Promise<Mark | undefined> {
+  const pending = pendingShots.get(index)
+  if (pending) await pending
+  return state.marks.find(m => m.index === index)
+}
+
 function ensurePopupLayer(): HTMLDivElement {
   if (popupLayer === null) {
     popupLayer = document.createElement('div')
@@ -1148,7 +1185,13 @@ function ensurePopupLayer(): HTMLDivElement {
 
 function renderPopup(): void {
   const layer = ensurePopupLayer()
+  // 2026-08-25: 截图回填会触发重渲染——同一标记且不 busy 时保住正在输入的评论
+  const prevTa = layer.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')
+  const typedText = prevTa !== null && !popupBusy && popupRenderedIndex === state.activeIndex
+    ? prevTa.value
+    : null
   layer.textContent = ''
+  popupRenderedIndex = state.activeIndex
   if (state.activeIndex === null) return
   const mark = state.marks.find(m => m.index === state.activeIndex)
   if (mark === undefined) { openMark(null); return }
@@ -1178,7 +1221,8 @@ function renderPopup(): void {
   const textarea = document.createElement('textarea')
   textarea.className = 'dsh-point-ext-popup-textarea'
   textarea.placeholder = mark.status === 'sent' ? '（已发送）' : '在此写下对所指对象的评论…'
-  textarea.value = mark.comment ?? ''
+  // 2026-08-25: 截图回填重渲染时恢复用户正在输入的内容（优先于已保存评论）
+  textarea.value = typedText ?? mark.comment ?? ''
   textarea.disabled = mark.status === 'sent' || popupBusy
   container.appendChild(textarea)
 
@@ -1212,6 +1256,12 @@ function renderPopup(): void {
     img.alt = '所指截图'
     wrap.appendChild(img)
     container.appendChild(wrap)
+  } else if (mark.screenshotError === undefined && pendingShots.has(mark.index)) {
+    // 2026-08-25: 截图异步回填期间给出反馈，完成后 updateMark 触发重渲染自动替换
+    const pending = document.createElement('div')
+    pending.className = 'dsh-point-ext-popup-hint'
+    pending.textContent = '截图生成中…'
+    container.appendChild(pending)
   }
 
   const actions = document.createElement('div')
@@ -1230,7 +1280,10 @@ function renderPopup(): void {
       popupBusy = true
       renderPopup()
       void (async () => {
-        const prepared = await composeLocalMark(mark)
+        // 2026-08-25: 截图异步回填——暂存/发送前等在途截图，保证暂存区与 dsh 都带图
+        const current = await awaitPendingShot(mark.index)
+        if (!current) { popupBusy = false; renderPopup(); return } // 等待期间标记已被删除
+        const prepared = await composeLocalMark(current)
         updateMark(mark.index, { screenshot: prepared.screenshot, comment, status: 'pending' })
         const staged: Mark = { ...prepared, comment, status: 'pending' }
         const sendTimeout = window.setTimeout(() => {
@@ -1267,7 +1320,10 @@ function renderPopup(): void {
       e.stopPropagation()
       const comment = textarea.value.trim()
       void (async () => {
-        const prepared = await composeLocalMark(mark)
+        // 2026-08-25: 截图异步回填——暂存/发送前等在途截图，保证暂存区与 dsh 都带图
+        const current = await awaitPendingShot(mark.index)
+        if (!current) { popupBusy = false; renderPopup(); return } // 等待期间标记已被删除
+        const prepared = await composeLocalMark(current)
         updateMark(mark.index, { screenshot: prepared.screenshot, comment, status: 'pending' })
         const staged: Mark = { ...prepared, comment, status: 'pending' }
         chrome.runtime.sendMessage({ type: 'STAGE_MARK', mark: staged, sendNow: false })
