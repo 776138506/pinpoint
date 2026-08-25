@@ -330,7 +330,7 @@ function onKeyDown(e: KeyboardEvent): void {
     if (currentTool !== null && state.activeIndex !== null) {
       currentTool = null
       activeStroke = null
-      renderPopup()
+      deactivateDrawingTool()
       return
     }
     if (isDragging) {
@@ -1089,9 +1089,11 @@ function renderDrawingLayer(container: HTMLElement, mark: Mark): { wrapper: HTML
     btn.dataset.tool = tool
     btn.addEventListener('click', (e) => {
       e.stopPropagation()
+      // 2026-08-25: 不再 renderPopup——重建会把正在输入的评论冲掉（textarea 按
+      // mark.comment 重建）；原地切换激活态即可
       currentTool = currentTool === tool ? null : tool
       activeStroke = null
-      renderPopup()
+      activateToolStyle()
     })
     return btn
   }
@@ -1168,7 +1170,8 @@ function renderDrawingLayer(container: HTMLElement, mark: Mark): { wrapper: HTML
     const { x, y } = toRatio(e)
     if (currentTool === 'pen') {
       activeStroke.points.push(x, y)
-      redrawCanvas(mark)
+      // 2026-08-25: 带 preview 实时预览——此前不带，笔迹松开鼠标才显示（感觉没画上）
+      redrawCanvas(mark, activeStroke)
       return
     }
     activeStroke.points = [activeStroke.points[0], activeStroke.points[1], x, y]
@@ -1188,8 +1191,13 @@ function renderDrawingLayer(container: HTMLElement, mark: Mark): { wrapper: HTML
   canvas.addEventListener('mouseup', endStroke)
   canvas.addEventListener('mouseleave', endStroke)
 
-  wrapper.appendChild(img)
-  wrapper.appendChild(canvas)
+  // 2026-08-25: 画布必须只盖图片——此前直接挂 wrapper（含工具条），CSS
+  // height:100% 把画布拉长到工具条高度，画的位置与落点纵向错位
+  const imgWrap = document.createElement('div')
+  imgWrap.className = 'dsh-point-ext-drawing-view'
+  imgWrap.appendChild(img)
+  imgWrap.appendChild(canvas)
+  wrapper.appendChild(imgWrap)
   wrapper.appendChild(toolbar)
   return { wrapper }
 }
@@ -1199,6 +1207,14 @@ function redrawCanvas(mark: Mark, preview?: Stroke | null): void {
   drawingCtx.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height)
   const strokes = strokeMap.get(mark.index) ?? []
   drawStrokes(drawingCtx, preview ? [...strokes, preview] : strokes, drawingCanvas.width, drawingCanvas.height)
+}
+
+// 2026-08-25: 原地取消工具激活——不 renderPopup（重建会把正在输入的评论冲掉）
+function deactivateDrawingTool(): void {
+  const toolbar = popupLayer?.querySelector('.dsh-point-ext-drawing-toolbar')
+  toolbar?.querySelectorAll('button[data-tool]').forEach(b => b.classList.remove('active'))
+  const canvas = popupLayer?.querySelector<HTMLElement>('.dsh-point-ext-drawing-canvas')
+  if (canvas) canvas.style.pointerEvents = 'none'
 }
 
 // 2026-08-24: compose whiteboard strokes onto the screenshot before staging/sending.
@@ -1617,6 +1633,10 @@ body.dsh-point-ext-marking .dsh-point-ext-badge { cursor: pointer; }
   border-radius: 6px;
   overflow: hidden;
   background: #f9fafb;
+}
+/* 2026-08-25: 画布的定位容器只含图片——画布 height:100% 对齐图片而非含工具条的 wrapper */
+.dsh-point-ext-drawing-view {
+  position: relative;
 }
 .dsh-point-ext-drawing-img {
   display: block;

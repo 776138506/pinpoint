@@ -793,3 +793,86 @@ describe('扩展侧性能路径（2026-08-25：视口快速截图 / 落笔采样
     expect(strokes[0]!.points).toHaveLength(6)
   })
 })
+
+describe('扩展侧评论窗绘画层修复（2026-08-25：工具切换丢评论 / 画笔无预览 / 画布错位）', () => {
+  async function openPopupMark(h: Harness): Promise<void> {
+    h.fireMessage({ type: 'TOGGLE_MARKING' })
+    const target = document.createElement('div')
+    target.id = 'draw-fix-target'
+    target.textContent = 'x'
+    target.style.width = '500px'
+    target.style.height = '500px'
+    document.body.appendChild(target)
+    dispatchMouseSequence(target, [
+      { type: 'mousedown', clientX: 100, clientY: 100 },
+      { type: 'mousemove', clientX: 103, clientY: 105 },
+      { type: 'mouseup', clientX: 103, clientY: 105 },
+      { type: 'click', clientX: 103, clientY: 105 },
+    ])
+    await flushAsync()
+  }
+  function penButton(): HTMLButtonElement {
+    return document.querySelector<HTMLButtonElement>('.dsh-point-ext-drawing-toolbar button[data-tool="pen"]')!
+  }
+
+  it('点击绘画工具不重建评论窗：正在输入的评论保留', async () => {
+    const h = setup()
+    await import('./content.ts')
+    await openPopupMark(h)
+    const textarea = document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!
+    textarea.value = '还没写完的评论'
+
+    penButton().click()
+
+    expect(document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!.value).toBe('还没写完的评论')
+    expect(penButton().classList.contains('active')).toBe(true)
+  })
+
+  it('Esc 退出工具同样保留评论', async () => {
+    const h = setup()
+    await import('./content.ts')
+    await openPopupMark(h)
+    penButton().click()
+    const textarea = document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!
+    textarea.value = 'Esc 前的评论'
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+
+    expect(penButton().classList.contains('active')).toBe(false)
+    expect(document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-popup-textarea')!.value).toBe('Esc 前的评论')
+  })
+
+  it('画笔拖动有实时预览（redraw 携带未完成笔迹）', async () => {
+    // jsdom 无 2d 上下文，stub 一个最小 ctx 让 redraw 走到 drawStrokes
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({ clearRect: () => {} } as never)
+    const h = setup()
+    await import('./content.ts')
+    await openPopupMark(h)
+    // jsdom 不加载图片，手动触发 load 让画布完成初始化
+    const img = document.querySelector<HTMLImageElement>('.dsh-point-ext-drawing-img')!
+    img.dispatchEvent(new Event('load'))
+    const { drawStrokes } = await import('../../src/client/drawing.ts')
+    vi.mocked(drawStrokes).mockClear()
+
+    penButton().click()
+    const canvas = document.querySelector<HTMLCanvasElement>('.dsh-point-ext-drawing-canvas')!
+    canvas.dispatchEvent(new MouseEvent('mousedown', { clientX: 10, clientY: 10, bubbles: true }))
+    canvas.dispatchEvent(new MouseEvent('mousemove', { clientX: 20, clientY: 20, bubbles: true }))
+
+    const calls = vi.mocked(drawStrokes).mock.calls
+    expect(calls.length).toBeGreaterThan(0)
+    // 预览调用必须包含未完成笔迹（committed 0 + preview 1 = 1 条）
+    expect((calls.at(-1)![1] as unknown[]).length).toBe(1)
+    vi.restoreAllMocks()
+  })
+
+  it('画布只覆盖图片区域（与工具条分离），坐标不纵向错位', async () => {
+    const h = setup()
+    await import('./content.ts')
+    await openPopupMark(h)
+    const canvas = document.querySelector<HTMLCanvasElement>('.dsh-point-ext-drawing-canvas')!
+    // 画布必须挂在只含 img 的相对容器内；挂在含工具条的 wrapper 下会被拉长
+    expect(canvas.parentElement!.classList.contains('dsh-point-ext-drawing-view')).toBe(true)
+    expect(canvas.parentElement!.querySelector('.dsh-point-ext-drawing-toolbar')).toBeNull()
+  })
+})
