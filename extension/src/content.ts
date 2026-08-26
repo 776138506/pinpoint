@@ -11,7 +11,7 @@
 import html2canvas from 'html2canvas'
 import { cloneForScreenshot, codeLocationFor, cssPath, detectExternalImages, documentRectOf, snippet, textFragmentFor, visibleText, xpathFor } from '../../src/client/mark-utils.ts'
 import { formatMarkText } from '../../src/client/util.ts'
-import { composeScreenshot, drawStrokes, eraseStrokes } from '../../src/client/drawing.ts'
+import { composeScreenshot, drawStrokes, eraseStrokes, textStrokeBBox } from '../../src/client/drawing.ts'
 import type { DrawTool, Stroke } from '../../src/client/drawing.ts'
 import { BUILTIN_SHORTCUT, comboFromEvent } from './shortcut.ts'
 import { DEFAULT_SETTINGS, loadSettings, onSettingsChanged, type ExtSettings } from './settings.ts'
@@ -147,7 +147,7 @@ function showHint(message: string): void {
 // 2026-08-20: 插件自有 UI 选择器——标记模式下悬停/点击必须排除（评论窗/角标/提示条）。
 // 教训：不可用 [class*="dsh-point-ext"] 子串匹配——body 上的标记态类名
 // dsh-point-ext-marking 会让每个元素都被排除，标记功能全灭（2026-08-21 事故）
-const OWN_UI_SELECTOR = '.dsh-point-ext-overlay, .dsh-point-ext-badge, .dsh-point-ext-popup-layer, .dsh-point-ext-popup, .dsh-point-ext-toast, .dsh-point-ext-board, .dsh-point-ext-board-toolbar'
+const OWN_UI_SELECTOR = '.dsh-point-ext-overlay, .dsh-point-ext-badge, .dsh-point-ext-popup-layer, .dsh-point-ext-popup, .dsh-point-ext-toast, .dsh-point-ext-board, .dsh-point-ext-board-toolbar, .dsh-point-ext-board-text'
 
 function highlight(el: Element): void {
   if (!el || el.nodeType !== 1) return
@@ -362,6 +362,9 @@ function onKeyDown(e: KeyboardEvent): void {
   if (e.repeat) return // 2026-08-24: 长按 repeat 会反复 toggle 标记态，只认第一次
   // 2026-08-25: Esc 最高层是白板模式（比标记态更靠近用户当前注意力）
   if (e.key === 'Escape' && drawingMode) {
+    // 2026-08-26: 文本输入框内的 Esc = 取消输入（textarea 自己的 handler 处理），
+    // 不退出整个白板——本监听是 capture 阶段，先于目标 handler 触发，必须在此让路
+    if (boardTextInput !== null && e.target === boardTextInput) return
     exitDrawingMode()
     return
   }
@@ -433,6 +436,101 @@ let boardLastErase: { x: number; y: number } | null = null
 const ERASE_RADIUS = 10 // px，文档坐标；ponytail: 固定半径，要做粗细档位再进设置
 let boardAnchors: ScrollAnchor[] = [] // 首笔落点处元素的内层滚动锚点
 
+// 2026-08-26: 撤销改快照栈（用户要求撤销覆盖橡皮擦除——切割是原位改写
+// boardStrokes，pop() 只能撤最后一笔，救不回被切掉的段）。每次变更前压入
+// 深拷贝快照：落笔提交 / 橡皮拖擦首次命中 / 清空 / 文本提交。上限 50 步。
+// ponytail: 全量快照而非逆操作——笔迹量小，快照实现零风险，逆操作要枚举每种变更
+const BOARD_UNDO_LIMIT = 50
+let boardUndo: Stroke[][] = []
+/** 橡皮拖擦期间只压一次快照（按下时延迟到首次命中才压，空擦不产生撤销步） */
+let boardEraseSnapshotPending = false
+
+function snapshotStrokes(strokes: readonly Stroke[]): Stroke[] {
+  return strokes.map(s => ({ ...s, points: [...s.points] }))
+}
+
+function pushBoardUndo(): void {
+  boardUndo.push(snapshotStrokes(boardStrokes))
+  if (boardUndo.length > BOARD_UNDO_LIMIT) boardUndo.shift()
+}
+
+function boardUndoPop(): void {
+  const prev = boardUndo.pop()
+  if (prev === undefined) {
+    showToast('没有可撤销的操作')
+    return
+  }
+  boardStrokes = prev
+  redrawBoard()
+  persistBoard()
+}
+
+// 2026-08-26: 文本工具（图文结合）——点画布出输入浮层，提交后落成 text 笔画，
+// 经 drawStrokes 统一渲染/合成，橡皮按包围盒整删（字形无法切割）
+const BOARD_TEXT_FONT_PX = 16 // 文档坐标 px；ponytail: 固定字号，要字号档位再进设置
+let boardTextInput: HTMLTextAreaElement | null = null
+// 2026-08-26: 暂存区白板 mark 再编辑——EDIT_BOARD 载入后此值为被编辑的 mark 编号，
+// 完成时原位更新该 mark（重截图 + 新笔迹）而不是新建
+let boardEditingIndex: number | null = null
+
+/* ---------- 白板笔迹持久化（2026-08-26：误刷新恢复 + 完成留档续画） ----------
+ * 存 chrome.storage.local，按 origin+pathname 键控——跨刷新/跨浏览器重启存活。
+ * 设计分工：笔迹（沟通符号）持久，页面快照永远实时（完成时现截）。
+ * 「完成」后留档 = 下次进白板自动恢复上次笔迹继续改（已发 mark 的"续画"）；
+ * 「清空」才删档。页面改版后旧笔迹可能错位——恢复时 toast 明示，一键清空。 */
+function boardStorageKey(): string {
+  return `board:${location.origin}${location.pathname}`
+}
+
+let boardSaveTimer: ReturnType<typeof setTimeout> | null = null
+
+// 变更后 debounce 落盘（拖擦/涂抹是高频事件，不能每帧写 storage）。
+// 注意 timer 触发时读的是当时的 boardStrokes——退出/完成会清空内存数组，
+// 那些路径必须走 flushPersistBoard 先落盘再清，否则存档被空数组覆盖
+function persistBoard(): void {
+  if (!chrome.runtime?.id) return
+  if (boardSaveTimer !== null) clearTimeout(boardSaveTimer)
+  boardSaveTimer = setTimeout(() => {
+    boardSaveTimer = null
+    chrome.storage.local.set({
+      [boardStorageKey()]: { strokes: snapshotStrokes(boardStrokes), updatedAt: Date.now() },
+    }).catch((e) => console.error('[dsh-point-ext] persist board failed (quota?):', e))
+  }, 500)
+}
+
+// 立即落盘当前笔迹（退出/完成前调用，赶在内存清空之前）
+function flushPersistBoard(): void {
+  if (!chrome.runtime?.id) return
+  if (boardSaveTimer !== null) { clearTimeout(boardSaveTimer); boardSaveTimer = null }
+  chrome.storage.local.set({
+    [boardStorageKey()]: { strokes: snapshotStrokes(boardStrokes), updatedAt: Date.now() },
+  }).catch((e) => console.error('[dsh-point-ext] persist board failed (quota?):', e))
+}
+
+function clearPersistedBoard(): void {
+  if (!chrome.runtime?.id) return
+  if (boardSaveTimer !== null) { clearTimeout(boardSaveTimer); boardSaveTimer = null }
+  chrome.storage.local.remove(boardStorageKey())
+    .catch((e) => console.error('[dsh-point-ext] clear persisted board failed:', e))
+}
+
+async function restorePersistedBoard(): Promise<void> {
+  if (!chrome.runtime?.id) return
+  try {
+    const key = boardStorageKey()
+    const data = await chrome.storage.local.get(key)
+    const saved = (data?.[key] as { strokes?: Stroke[] } | undefined)?.strokes
+    // 进入白板期间用户可能已开始涂抹——只在仍为空时恢复，不覆盖在途内容
+    if (drawingMode && Array.isArray(saved) && saved.length > 0 && boardStrokes.length === 0 && boardEditingIndex === null) {
+      boardStrokes = saved
+      redrawBoard()
+      showToast(`已恢复上次笔迹（${saved.length} 笔），页面若已改版可点「清空」重画`)
+    }
+  } catch (e) {
+    console.error('[dsh-point-ext] restore board failed:', e)
+  }
+}
+
 function boardDelta(): { dx: number; dy: number } {
   let dx = 0
   let dy = 0
@@ -467,6 +565,10 @@ function redrawBoard(): void {
   const toView = (s: Stroke): Stroke => ({
     tool: s.tool,
     points: s.points.map((v, i) => (i % 2 === 0 ? (v - offX) / vw : (v - offY) / vh)),
+    ...(s.text !== undefined ? { text: s.text } : {}),
+    // font 与 y 同基准缩放（文档 px → 视口高度比），漏转会被 drawStrokes 当
+    // 归一化比率放大 vh 倍（实机踩中：16px 变 13536px，文本画出屏外不可见）
+    ...(s.font !== undefined ? { font: s.font / vh } : {}),
   })
   const all = boardActive !== null ? [...boardStrokes, boardActive] : boardStrokes
   drawStrokes(boardCtx, all.map(toView), vw, vh)
@@ -506,18 +608,73 @@ function onBoardDown(e: MouseEvent): void {
   const p = boardPoint(e)
   if (boardTool === 'eraser') {
     boardErasing = true
+    boardEraseSnapshotPending = true
     boardLastErase = p
     applyErase(p.x, p.y, p.x, p.y)
+    return
+  }
+  if (boardTool === 'text') {
+    openBoardTextInput(p)
     return
   }
   boardActive = { tool: boardTool, points: [p.x, p.y, p.x, p.y] }
   scheduleBoardRedraw()
 }
 
-// 橡皮沿路径切割笔画：擦过哪段切哪段，不整条删（整条删 = 撤销的重复功能）
+/* ---------- 白板文本输入（2026-08-26：图文结合） ---------- */
+
+function closeBoardTextInput(commit: boolean): void {
+  const ta = boardTextInput
+  if (ta === null) return
+  boardTextInput = null
+  const text = ta.value.trim()
+  const x = Number(ta.dataset.x)
+  const y = Number(ta.dataset.y)
+  ta.remove()
+  if (!commit || text === '') return
+  pushBoardUndo()
+  // font 与 points 同坐标系（文档 px），渲染/合成时随高度基准缩放
+  boardStrokes.push({ tool: 'text', points: [x, y], text, font: BOARD_TEXT_FONT_PX })
+  redrawBoard()
+  persistBoard()
+}
+
+function openBoardTextInput(p: { x: number; y: number }): void {
+  // 已有输入框先提交（点别处 = 落字，符合白板直觉）
+  closeBoardTextInput(true)
+  const ta = document.createElement('textarea')
+  ta.className = 'dsh-point-ext-board-text'
+  ta.rows = 1
+  ta.placeholder = '输入文字，Enter 提交，Esc 取消'
+  ta.dataset.x = String(p.x)
+  ta.dataset.y = String(p.y)
+  // 画布是 fixed 盖视口，文本框用 absolute 挂文档坐标——滚动时随内容一起走，与笔迹一致
+  ta.style.left = `${p.x}px`
+  ta.style.top = `${p.y}px`
+  ta.style.fontSize = `${BOARD_TEXT_FONT_PX}px`
+  ta.addEventListener('keydown', (e) => {
+    e.stopPropagation()
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); closeBoardTextInput(true) }
+    else if (e.key === 'Escape') { e.preventDefault(); closeBoardTextInput(false) }
+  })
+  ta.addEventListener('mousedown', (e) => e.stopPropagation())
+  // 失焦 = 提交（点画布别处/工具条都会触发 blur，不丢已输入内容）
+  ta.addEventListener('blur', () => closeBoardTextInput(true))
+  document.documentElement.appendChild(ta)
+  boardTextInput = ta
+  ta.focus()
+}
+
+// 橡皮沿路径切割笔画：擦过哪段切哪段，不整条删（整条删 = 撤销的重复功能）。
+// 文本笔画例外——字形无法切割，擦到包围盒整删（标准白板行为）。
+// 首次命中才压撤销快照：空擦不产生撤销步
 function applyErase(ex1: number, ey1: number, ex2: number, ey2: number): void {
   const { strokes, changed } = eraseStrokes(boardStrokes, ex1, ey1, ex2, ey2, ERASE_RADIUS)
   if (!changed) return
+  if (boardEraseSnapshotPending) {
+    pushBoardUndo()
+    boardEraseSnapshotPending = false
+  }
   boardStrokes = strokes
   scheduleBoardRedraw()
 }
@@ -557,6 +714,8 @@ function onBoardUp(e: MouseEvent): void {
     applyErase(last.x, last.y, p.x, p.y)
     boardErasing = false
     boardLastErase = null
+    boardEraseSnapshotPending = false
+    persistBoard()
     return
   }
   if (boardActive === null) return
@@ -571,25 +730,35 @@ function onBoardUp(e: MouseEvent): void {
     boardActive.points[2] = p.x
     boardActive.points[3] = p.y
   }
+  pushBoardUndo()
   boardStrokes.push(boardActive)
   boardActive = null
   scheduleBoardRedraw()
+  persistBoard()
 }
 
 async function finishBoard(): Promise<void> {
+  closeBoardTextInput(true) // 未提交的文本框先落字，不丢已输入内容
   if (boardStrokes.length === 0) {
     showToast('白板上还没有涂抹内容')
     return
   }
-  // 笔迹包围盒 + 边距，钳到文档范围
+  // 笔迹包围盒 + 边距，钳到文档范围；文本笔画按估算包围盒计入
   let x1 = Infinity
   let y1 = Infinity
   let x2 = -Infinity
   let y2 = -Infinity
   for (const s of boardStrokes) {
+    if (s.tool === 'text') {
+      const bb = textStrokeBBox(s, 1) // font/points 同为文档 px，基准 1 即原样
+      if (bb === null) continue
+      x1 = Math.min(x1, bb.x); y1 = Math.min(y1, bb.y)
+      x2 = Math.max(x2, bb.x + bb.width); y2 = Math.max(y2, bb.y + bb.height)
+      continue
+    }
     for (let i = 0; i < s.points.length; i += 2) {
       x1 = Math.min(x1, s.points[i]!)
-      y1 = Math.min(y1, s.points[i + 1]!)
+      y1 = Math.min(y1, s.points[i]!)
       x2 = Math.max(x2, s.points[i]!)
       y2 = Math.max(y2, s.points[i + 1]!)
     }
@@ -607,15 +776,61 @@ async function finishBoard(): Promise<void> {
     showToast('涂抹区域过小，无法生成所指')
     return
   }
-  // 笔迹归一化到包围盒（= 截图坐标系），随 mark 入 strokeMap 由发送管线合成
+  // 笔迹归一化到包围盒（= 截图坐标系），随 mark 入 strokeMap 由发送管线合成；
+  // font 与 y 同基准缩放（除以 rect.height）
   const strokes: Stroke[] = boardStrokes.map(s => ({
     tool: s.tool,
     points: s.points.map((v, i) => (i % 2 === 0 ? (v - rect.x) / rect.width : (v - rect.y) / rect.height)),
+    ...(s.text !== undefined ? { text: s.text } : {}),
+    ...(s.font !== undefined ? { font: s.font / rect.height } : {}),
   }))
   const anchors = boardAnchors
-  // 先撤画布再截图——否则笔迹被 html2canvas 截进底图，发送时合成会双重叠加
+  const editingIndex = boardEditingIndex
+  // 先撤画布再截图——否则笔迹被 html2canvas 截进底图，发送时合成会双重叠加。
+  // 2026-08-26: 完成后笔迹快照保留（persistBoard 已落盘）——下次进白板恢复续画；
+  // exitDrawingMode 只撤 UI 与内存，不动存档（「清空」才删档）
   exitDrawingMode()
+  if (editingIndex !== null) {
+    refinishEditedMark(editingIndex, rect, anchors, strokes)
+    return
+  }
   await captureRegion(rect, anchors, strokes)
+}
+
+// 2026-08-26: 暂存区白板 mark 再编辑的完成路径——原位更新 mark（新包围盒 +
+// 重截图 + 新笔迹），并通知侧栏刷新暂存条目（面板按 (tabId, index) 复合键覆盖）。
+// 截图失败保留旧截图，笔迹已更新（下次暂存/发送按新笔迹合成）。
+function refinishEditedMark(
+  index: number,
+  rect: { x: number; y: number; width: number; height: number },
+  anchors: ScrollAnchor[],
+  strokes: Stroke[],
+): void {
+  const existing = state.marks.find(m => m.index === index)
+  if (!existing) return
+  strokeMap.set(index, strokes)
+  if (anchors.length > 0) regionAnchors.set(index, anchors)
+  const selector = `region:${rect.x},${rect.y},${rect.width},${rect.height}`
+  // 复用在途承诺管线：暂存/发送侧 awaitPendingShot 会等它，防带旧截图发送
+  pendingShots.set(index, (async () => {
+    try {
+      const canvas = await captureRegionCanvas(rect)
+        updateMark(index, { screenshot: canvas.toDataURL('image/png'), selector, anchor: { rect }, screenshotError: undefined })
+      const fresh = state.marks.find(m => m.index === index)
+      if (fresh && fresh.status !== 'draft') {
+        chrome.runtime.sendMessage({ type: 'STAGE_MARK', mark: fresh, sendNow: false })
+          .catch((e) => console.error('[dsh-point-ext] re-stage after board edit failed:', e))
+      }
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e)
+      console.error('[dsh-point-ext] board re-edit screenshot failed:', e)
+      updateMark(index, { screenshotError: reason })
+      showToast(`重截图失败：${reason}。旧截图保留。`)
+    } finally {
+      pendingShots.delete(index)
+    }
+  })())
+  showToast(`所指 #${index} 已更新`)
 }
 
 function enterDrawingMode(): void {
@@ -631,9 +846,12 @@ function enterDrawingMode(): void {
   boardStrokes = []
   boardActive = null
   boardErasing = false
+  boardEraseSnapshotPending = false
   boardLastErase = null
   boardAnchors = []
   boardTool = 'pen'
+  boardUndo = []
+  boardEditingIndex = null
 
   boardCanvas = document.createElement('canvas')
   boardCanvas.className = 'dsh-point-ext-board'
@@ -650,6 +868,7 @@ function enterDrawingMode(): void {
     { tool: 'pen', label: '画笔' },
     { tool: 'arrow', label: '箭头' },
     { tool: 'rect', label: '矩形' },
+    { tool: 'text', label: '文本' },
     { tool: 'eraser', label: '橡皮' },
   ]
   for (const t of tools) {
@@ -660,6 +879,7 @@ function enterDrawingMode(): void {
     btn.classList.toggle('active', t.tool === boardTool)
     btn.addEventListener('click', (e) => {
       e.stopPropagation()
+      closeBoardTextInput(true) // 切工具前落字，不丢在途输入
       boardTool = t.tool
       boardToolbar?.querySelectorAll('button[data-tool]').forEach(b => b.classList.toggle('active', (b as HTMLElement).dataset.tool === t.tool))
     })
@@ -668,10 +888,11 @@ function enterDrawingMode(): void {
   const undoBtn = document.createElement('button')
   undoBtn.type = 'button'
   undoBtn.textContent = '撤销'
+  undoBtn.title = '撤销上一步（含橡皮擦除）'
   undoBtn.addEventListener('click', (e) => {
     e.stopPropagation()
-    boardStrokes.pop()
-    redrawBoard()
+    closeBoardTextInput(true)
+    boardUndoPop()
   })
   boardToolbar.appendChild(undoBtn)
   const clearBtn = document.createElement('button')
@@ -679,8 +900,12 @@ function enterDrawingMode(): void {
   clearBtn.textContent = '清空'
   clearBtn.addEventListener('click', (e) => {
     e.stopPropagation()
+    closeBoardTextInput(false)
+    if (boardStrokes.length === 0) return
+    pushBoardUndo() // 清空也可撤销——误清能救回
     boardStrokes = []
     redrawBoard()
+    clearPersistedBoard() // 唯一删档入口：退出/完成都留档续画
   })
   boardToolbar.appendChild(clearBtn)
   const finishBtn = document.createElement('button')
@@ -703,18 +928,26 @@ function enterDrawingMode(): void {
   document.documentElement.appendChild(boardToolbar)
 
   redrawBoard()
+  // 异步恢复存档（误刷新/续画）；在途内容优先，见 restorePersistedBoard
+  void restorePersistedBoard()
 }
 
 function exitDrawingMode(): void {
+  closeBoardTextInput(true) // 退出前落字——已输入内容不丢
+  flushPersistBoard() // 赶在内存清空前落盘（debounced persist 读清空后的空数组会毁档）
   drawingMode = false
   boardStrokes = []
   boardActive = null
   boardErasing = false
+  boardEraseSnapshotPending = false
   boardLastErase = null
   boardAnchors = []
+  boardUndo = []
+  boardEditingIndex = null
   if (boardCanvas !== null) { boardCanvas.remove(); boardCanvas = null }
   boardCtx = null
   if (boardToolbar !== null) { boardToolbar.remove(); boardToolbar = null }
+  // 存档不动：退出 ≠ 放弃，重进白板恢复续画；要删档用「清空」
 }
 
 /* ---------- capture ---------- */
@@ -825,6 +1058,40 @@ async function captureRegion(rect: { x: number; y: number; width: number; height
   }
 }
 
+// 2026-08-26: 区域截图抽出共享——captureRegionInner（新建 mark）与
+// refinishEditedMark（再编辑重截图）共用同一条 html2canvas 路径
+async function captureRegionCanvas(rect: { x: number; y: number; width: number; height: number }): Promise<HTMLCanvasElement> {
+  const de = document.documentElement
+  // 2026-08-25: 视口内区域走快速路径——克隆窗口保持视口大小、裁剪坐标换算成
+  // 视口坐标。布局/媒体查询与用户当前所见一致（更保真），且免去整文档渲染
+  // （长页面截图卡顿大头）。只有超出视口的区域才撑整文档窗口（慢速兜底）。
+  const sx = window.scrollX
+  const sy = window.scrollY
+  const inViewport = rect.x >= sx && rect.y >= sy
+    && rect.x + rect.width <= sx + window.innerWidth
+    && rect.y + rect.height <= sy + window.innerHeight
+  const startedAt = performance.now()
+  const canvas = await Promise.race([
+    html2canvas(document.documentElement, {
+      backgroundColor: '#ffffff',
+      scale: 1,
+      logging: false,
+      useCORS: true,
+      allowTaint: false,
+      x: inViewport ? rect.x - sx : rect.x,
+      y: inViewport ? rect.y - sy : rect.y,
+      width: rect.width,
+      height: rect.height,
+      windowWidth: !inViewport && de.scrollWidth > 0 ? de.scrollWidth : undefined,
+      windowHeight: !inViewport && de.scrollHeight > 0 ? de.scrollHeight : undefined,
+    }),
+    new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`截图超时（${extSettings.screenshotTimeoutMs}ms）`)), extSettings.screenshotTimeoutMs)),
+  ])
+  // 实机性能观测点：卡顿时让用户开控制台看这个耗时即可定位是哪个路径慢
+  console.debug(`[dsh-point-ext] region screenshot took ${Math.round(performance.now() - startedAt)}ms (${inViewport ? 'viewport' : 'full-document'} path)`)
+  return canvas
+}
+
 async function captureRegionInner(rect: { x: number; y: number; width: number; height: number }, anchors: ScrollAnchor[], strokes?: Stroke[]): Promise<void> {
   settleDraft()
   const mark: Mark = {
@@ -852,34 +1119,7 @@ async function captureRegionInner(rect: { x: number; y: number; width: number; h
   // pendingShots 先于 addMark/openMark 挂上，弹窗首帧就能显示「截图生成中」
   pendingShots.set(mark.index, (async () => {
     try {
-      const de = document.documentElement
-      // 2026-08-25: 视口内区域走快速路径——克隆窗口保持视口大小、裁剪坐标换算成
-      // 视口坐标。布局/媒体查询与用户当前所见一致（更保真），且免去整文档渲染
-      // （长页面截图卡顿大头）。只有超出视口的区域才撑整文档窗口（慢速兜底）。
-      const sx = window.scrollX
-      const sy = window.scrollY
-      const inViewport = rect.x >= sx && rect.y >= sy
-        && rect.x + rect.width <= sx + window.innerWidth
-        && rect.y + rect.height <= sy + window.innerHeight
-      const startedAt = performance.now()
-      const canvas = await Promise.race([
-        html2canvas(document.documentElement, {
-          backgroundColor: '#ffffff',
-          scale: 1,
-          logging: false,
-          useCORS: true,
-          allowTaint: false,
-          x: inViewport ? rect.x - sx : rect.x,
-          y: inViewport ? rect.y - sy : rect.y,
-          width: rect.width,
-          height: rect.height,
-          windowWidth: !inViewport && de.scrollWidth > 0 ? de.scrollWidth : undefined,
-          windowHeight: !inViewport && de.scrollHeight > 0 ? de.scrollHeight : undefined,
-        }),
-        new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`截图超时（${extSettings.screenshotTimeoutMs}ms）`)), extSettings.screenshotTimeoutMs)),
-      ])
-      // 实机性能观测点：卡顿时让用户开控制台看这个耗时即可定位是哪个路径慢
-      console.debug(`[dsh-point-ext] region screenshot took ${Math.round(performance.now() - startedAt)}ms (${inViewport ? 'viewport' : 'full-document'} path)`)
+      const canvas = await captureRegionCanvas(rect)
       updateMark(mark.index, { screenshot: canvas.toDataURL('image/png') })
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e)
@@ -1222,6 +1462,8 @@ function findMarkedAncestor(el: Element): Element | null {
 }
 
 // 2026-08-24: compose whiteboard strokes onto the screenshot before staging/sending.
+// 2026-08-26: 合成后不再删 strokeMap——暂存区「改图」再编辑要取回笔迹；
+// 笔迹随 removeMark/clearMarks 出清（mark 生命周期终点），内存占用可控
 async function composeLocalMark(mark: Mark): Promise<Mark> {
   const strokes = strokeMap.get(mark.index)
   if (!strokes || strokes.length === 0) return mark
@@ -1230,7 +1472,6 @@ async function composeLocalMark(mark: Mark): Promise<Mark> {
     console.error('[dsh-point-ext] compose screenshot failed, staging original screenshot')
     return mark
   }
-  strokeMap.delete(mark.index)
   return { ...mark, screenshot: result }
 }
 
@@ -1673,6 +1914,21 @@ body.dsh-point-ext-marking .dsh-point-ext-badge { cursor: pointer; }
   border-color: #2563eb;
   color: #ffffff;
 }
+/* 2026-08-26: 白板文本输入浮层——absolute 挂文档坐标，随页面滚动与笔迹一致 */
+.dsh-point-ext-board-text {
+  position: absolute;
+  z-index: 2147483004;
+  min-width: 160px;
+  padding: 2px 4px;
+  border: 1px dashed #ff2d55;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #ff2d55;
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.2;
+  resize: both;
+  outline: none;
+}
 /* 2026-08-25: 评论窗截图只读预览（白板唯一入口=页面白板，评论窗不再内嵌绘画）。
    截图装在独立滚动容器里：超高截图在容器内滚动，不撑爆弹窗、不挤走按钮 */
 .dsh-point-ext-popup-shot-wrap {
@@ -1763,6 +2019,34 @@ function mount(): void {
     if (message?.type === 'START_DRAWING') {
       enterDrawingMode()
       sendResponse({ drawing: drawingMode })
+      return false
+    }
+    // 2026-08-26: 暂存区白板 mark 再编辑——把该 mark 的归一化笔迹反算回文档坐标
+    // 载入白板，完成时走 refinishEditedMark 原位更新。页面刷新后 mark/笔迹已随
+    // content 实例销毁（设计决策：不做跨刷新恢复，旧笔迹对不上新页面是有害的），
+    // 此时如实报失败，引导重新标记
+    if (message?.type === 'EDIT_BOARD') {
+      const index = message.index as number
+      const mark = state.marks.find(m => m.index === index)
+      const strokes = strokeMap.get(index)
+      const rect = mark?.anchor?.rect
+      if (!mark || !strokes || strokes.length === 0 || !rect) {
+        sendResponse({ ok: false, reason: '原页面已刷新或标记已删除，笔迹不可用——请重新标记' })
+        return false
+      }
+      enterDrawingMode()
+      // enterDrawingMode 复位了 editingIndex，这里重设；restorePersistedBoard 见
+      // editingIndex 非空会跳过存档恢复，不覆盖载入的笔迹
+      boardEditingIndex = index
+      boardStrokes = strokes.map(s => ({
+        tool: s.tool,
+        points: s.points.map((v, i) => (i % 2 === 0 ? v * rect.width + rect.x : v * rect.height + rect.y)),
+        ...(s.text !== undefined ? { text: s.text } : {}),
+        ...(s.font !== undefined ? { font: s.font * rect.height } : {}),
+      }))
+      redrawBoard()
+      showToast(`正在编辑所指 #${index} 的笔迹，点「完成」更新暂存`)
+      sendResponse({ ok: true })
       return false
     }
     if (message?.type === 'FOCUS_MARK') {

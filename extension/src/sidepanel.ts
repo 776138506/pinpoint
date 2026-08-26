@@ -259,6 +259,17 @@ function renderOutbox(): void {
     editBtn.disabled = item.status === 'sending' || item.status === 'sent'
     editBtn.addEventListener('click', () => toggleEditor(row, item))
 
+    // 2026-08-26: 白板/框选 mark 笔迹再编辑——回来源页重开白板载入笔迹，
+    // 完成后原位更新暂存条目。仅 region mark（白板/框选产物）显示此按钮
+    let boardBtn: HTMLButtonElement | null = null
+    if (item.mark.selector.startsWith('region:')) {
+      boardBtn = document.createElement('button')
+      boardBtn.textContent = '改图'
+      boardBtn.title = '在来源页面重新打开白板编辑笔迹'
+      boardBtn.disabled = item.status === 'sending' || item.status === 'sent'
+      boardBtn.addEventListener('click', () => void editBoard(item))
+    }
+
     const delBtn = document.createElement('button')
     delBtn.textContent = '删除'
     delBtn.className = 'danger'
@@ -267,6 +278,7 @@ function renderOutbox(): void {
 
     actions.appendChild(sendBtn)
     actions.appendChild(editBtn)
+    if (boardBtn !== null) actions.appendChild(boardBtn)
     actions.appendChild(delBtn)
     row.appendChild(actions)
     outboxEl.appendChild(row)
@@ -321,6 +333,21 @@ function focusItem(item: OutboxItem): void {
     return
   }
   safePost({ type: 'FOCUS_MARK', tabId: item.tabId, index: item.mark.index })
+}
+
+// 2026-08-26: 暂存区白板 mark 再编辑入口——让来源页 content 重开白板并载入笔迹。
+// 失败（页面已刷新/标记已删）如实提示，不静默（跨刷新恢复是有意不做的设计，
+// 见 content.ts EDIT_BOARD 分支注释）
+async function editBoard(item: OutboxItem): Promise<void> {
+  markHintEl.textContent = ''
+  const res = await sendToTab(item.tabId, { type: 'EDIT_BOARD', index: item.mark.index }) as { ok?: boolean; reason?: string } | undefined
+  if (res?.ok) {
+    markHintEl.textContent = `已在来源页面打开所指 #${item.mark.index} 的白板编辑`
+    markHintEl.style.color = '#059669'
+    return
+  }
+  markHintEl.textContent = res?.reason ?? '无法连接来源页面（可能已关闭），改图失败'
+  markHintEl.style.color = '#d97706'
 }
 
 function sendItem(item: OutboxItem): void {

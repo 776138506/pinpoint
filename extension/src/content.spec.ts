@@ -45,6 +45,8 @@ interface Harness {
   sendMessage: ReturnType<typeof vi.fn>
   fireMessage: (msg: unknown) => unknown
   runtime: { id: string }
+  /** 2026-08-26: 有后端的 storage.local mock——白板笔迹持久化断言用 */
+  localStore: Record<string, unknown>
 }
 
 function setup(): Harness {
@@ -59,16 +61,24 @@ function setup(): Harness {
     onMessage: { addListener: (fn: MessageListener) => { messageListener = fn } },
     sendMessage,
   }
+  const localStore: Record<string, unknown> = {}
   vi.stubGlobal('chrome', {
     runtime,
     storage: {
-      local: { get: () => Promise.resolve({}) },
+      local: {
+        get: (key?: string) => Promise.resolve(
+          typeof key === 'string' ? { [key]: localStore[key] } : { ...localStore },
+        ),
+        set: (items: Record<string, unknown>) => { Object.assign(localStore, items); return Promise.resolve() },
+        remove: (key: string) => { delete localStore[key]; return Promise.resolve() },
+      },
       onChanged: { addListener: () => {} },
     },
   })
   return {
     sendMessage,
     runtime,
+    localStore,
     fireMessage: (msg) => {
       let response: unknown
       messageListener?.(msg, {}, (r) => { response = r })
@@ -610,6 +620,188 @@ describe('扩展侧页面白板模式（2026-08-25：画笔涂抹 → 截图发 
     const strokes = vi.mocked(composeScreenshot).mock.calls[0]![1] as Array<{ tool: string; points: number[] }>
     expect(strokes).toHaveLength(2)
     for (const s of strokes) expect(s.tool).toBe('pen')
+  })
+
+  it('撤销覆盖橡皮擦除：擦断的笔画一键复原（2026-08-26 用户要求）', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    vi.mocked(composeScreenshot).mockClear()
+    const h = setup()
+    await import('./content.ts')
+    const canvas = startBoard(h)
+
+    drawPenStroke(canvas, [100, 100], [300, 100])
+    const eraserBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '橡皮')!
+    eraserBtn.click()
+    drawPenStroke(canvas, [200, 90], [200, 110]) // 擦成两段
+
+    const undoBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '撤销')!
+    undoBtn.click()
+
+    finishButton().click()
+    await flushAsync()
+    await flushAsync()
+    const sendBtn = document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-popup-btn.primary')[0]!
+    sendBtn.click()
+    await flushAsync()
+
+    // 撤销橡皮后应恢复成一条完整 pen 笔画，而不是两段
+    const strokes = vi.mocked(composeScreenshot).mock.calls[0]![1] as Array<{ tool: string; points: number[] }>
+    expect(strokes).toHaveLength(1)
+    expect(strokes[0]!.tool).toBe('pen')
+  })
+
+  it('撤销覆盖清空：误清可救回', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    vi.mocked(composeScreenshot).mockClear()
+    const h = setup()
+    await import('./content.ts')
+    const canvas = startBoard(h)
+
+    drawPenStroke(canvas, [100, 100], [300, 100])
+    const clearBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '清空')!
+    clearBtn.click()
+    // 清空后完成应提示无内容
+    finishButton().click()
+    await flushAsync()
+    expect(document.querySelector('.dsh-point-ext-toast')?.textContent).toContain('还没有涂抹内容')
+
+    const undoBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '撤销')!
+    undoBtn.click()
+    finishButton().click()
+    await flushAsync()
+    await flushAsync()
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ selector: string }> }
+    expect(s.marks).toHaveLength(1)
+  })
+
+  it('文本工具：点画布出输入框，Enter 提交落成 text 笔画参与合成（图文结合）', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    vi.mocked(composeScreenshot).mockClear()
+    const h = setup()
+    await import('./content.ts')
+    const canvas = startBoard(h)
+
+    const textBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '文本')!
+    textBtn.click()
+    canvas.dispatchEvent(new MouseEvent('mousedown', { clientX: 120, clientY: 200, button: 0, bubbles: true }))
+    const ta = document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-board-text')
+    expect(ta).not.toBeNull()
+    ta!.value = '往右移 20px'
+    ta!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    expect(document.querySelector('.dsh-point-ext-board-text')).toBeNull() // 提交后输入框消失
+
+    finishButton().click()
+    await flushAsync()
+    await flushAsync()
+    const sendBtn = document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-popup-btn.primary')[0]!
+    sendBtn.click()
+    await flushAsync()
+
+    const strokes = vi.mocked(composeScreenshot).mock.calls[0]![1] as Array<{ tool: string; text?: string; font?: number }>
+    expect(strokes).toHaveLength(1)
+    expect(strokes[0]!.tool).toBe('text')
+    expect(strokes[0]!.text).toBe('往右移 20px')
+    expect(strokes[0]!.font).toBeGreaterThan(0)
+  })
+
+  it('文本工具：Esc 取消不落字', async () => {
+    const h = setup()
+    await import('./content.ts')
+    const canvas = startBoard(h)
+
+    Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '文本')!.click()
+    canvas.dispatchEvent(new MouseEvent('mousedown', { clientX: 120, clientY: 200, button: 0, bubbles: true }))
+    const ta = document.querySelector<HTMLTextAreaElement>('.dsh-point-ext-board-text')!
+    ta.value = '不要这句'
+    ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+
+    finishButton().click()
+    await flushAsync()
+    expect(document.querySelector('.dsh-point-ext-toast')?.textContent).toContain('还没有涂抹内容')
+  })
+
+  it('笔迹持久化：退出即落盘，重进白板自动恢复，清空删档', async () => {
+    const h = setup()
+    await import('./content.ts')
+    const key = `board:${location.origin}${location.pathname}`
+    const canvas = startBoard(h)
+    drawPenStroke(canvas, [100, 100], [300, 100])
+
+    // 退出（显式按钮）→ flush 落盘，笔迹入存档
+    Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '退出')!.click()
+    await flushAsync()
+    const saved = h.localStore[key] as { strokes: unknown[] } | undefined
+    expect(saved?.strokes).toHaveLength(1)
+
+    // 重进白板 → 自动恢复 + toast 明示（误刷新/续画同一条路径）
+    startBoard(h)
+    await flushAsync()
+    await flushAsync()
+    expect(document.querySelector('.dsh-point-ext-toast')?.textContent).toContain('已恢复上次笔迹')
+
+    // 清空 = 唯一删档入口
+    Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '清空')!.click()
+    await flushAsync()
+    expect(h.localStore[key]).toBeUndefined()
+  })
+
+  it('暂存区白板 mark 再编辑：EDIT_BOARD 载入笔迹，完成后原位更新并重新暂存', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    vi.mocked(composeScreenshot).mockClear()
+    const h = setup()
+    await import('./content.ts')
+    const canvas = startBoard(h)
+
+    drawPenStroke(canvas, [100, 100], [150, 120])
+    finishButton().click()
+    await flushAsync()
+    await flushAsync()
+
+    // 评论窗点「暂存」→ mark pending
+    const stageBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-popup-btn'))
+      .find(b => b.textContent === '暂存')!
+    stageBtn.click()
+    await flushAsync()
+    h.sendMessage.mockClear()
+
+    // 侧栏点「改图」→ EDIT_BOARD → 白板重开并载入笔迹
+    const res = h.fireMessage({ type: 'EDIT_BOARD', index: 1 }) as { ok: boolean }
+    expect(res.ok).toBe(true)
+    const canvas2 = document.querySelector<HTMLCanvasElement>('.dsh-point-ext-board')!
+    expect(canvas2).not.toBeNull()
+
+    // 加画一笔后完成 → 原位更新 #1（不新建 mark），并重新 STAGE_MARK
+    drawPenStroke(canvas2, [200, 200], [260, 220])
+    Array.from(document.querySelectorAll<HTMLButtonElement>('.dsh-point-ext-board-toolbar button'))
+      .find(b => b.textContent === '完成')!.click()
+    await flushAsync()
+    await flushAsync()
+    await flushAsync()
+
+    const s = h.fireMessage({ type: 'GET_STATE' }) as { marks: Array<{ index: number; selector: string }> }
+    expect(s.marks).toHaveLength(1) // 原位更新，不新增
+    const stageCalls = h.sendMessage.mock.calls.filter(
+      c => (c[0] as { type?: string }).type === 'STAGE_MARK',
+    )
+    expect(stageCalls).toHaveLength(1)
+    expect((stageCalls[0]![0] as { mark: { index: number } }).mark.index).toBe(1)
+  })
+
+  it('EDIT_BOARD 对不存在的 mark 如实失败（页面刷新后笔迹已销毁的设计）', async () => {
+    const h = setup()
+    await import('./content.ts')
+    const res = h.fireMessage({ type: 'EDIT_BOARD', index: 99 }) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toContain('重新标记')
+    expect(document.querySelector('.dsh-point-ext-board')).toBeNull()
   })
 
   it('空白板点完成：提示且不产出 mark，白板保持', async () => {

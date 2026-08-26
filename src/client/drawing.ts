@@ -7,12 +7,21 @@
  */
 
 /** Supported drawing tools. */
-export type DrawTool = 'pen' | 'arrow' | 'rect'
+export type DrawTool = 'pen' | 'arrow' | 'rect' | 'text'
 
-/** One stroke: tool kind + normalized point pairs [x1, y1, x2, y2, ...]. */
+/**
+ * One stroke: tool kind + normalized point pairs [x1, y1, x2, y2, ...].
+ * `text` strokes carry the literal text plus `font` — font size in the SAME
+ * unit space as `points` (normalized strokes → ratio of the height basis,
+ * like y coordinates), so it scales with whatever canvas it is drawn onto.
+ */
 export interface Stroke {
   tool: DrawTool
   points: number[]
+  /** Literal text content (text strokes only). May contain newlines. */
+  text?: string
+  /** Font size in the points' coordinate space (text strokes only). */
+  font?: number
 }
 
 /** 2-D point used by arrow-head geometry. */
@@ -24,6 +33,11 @@ export interface Point {
 /** Fixed drawing style. */
 const STROKE_COLOR = '#ff2d55'
 const LINE_WIDTH = 3
+
+/** Default font size for text strokes, as a ratio of the canvas height (≈16px on an 800px-tall canvas). */
+const DEFAULT_FONT_RATIO = 0.02
+/** Line-height factor for multi-line text. */
+const TEXT_LINE_HEIGHT = 1.2
 
 /**
  * Compute the two base points of a solid triangular arrow head.
@@ -70,6 +84,20 @@ export function drawStrokes(
   ctx.lineCap = 'round'
   ctx.lineJoin = 'round'
   for (const stroke of strokes) {
+    // 文本笔画只有锚点（2 个坐标值），必须先于「<4 跳过」分支处理
+    if (stroke.tool === 'text') {
+      if (!stroke.text) continue
+      const [ax, ay] = toPixel(stroke.points, width, height)
+      if (ax === undefined || ay === undefined) continue
+      const fontPx = (stroke.font ?? DEFAULT_FONT_RATIO) * height
+      ctx.font = `${fontPx}px sans-serif`
+      ctx.textBaseline = 'top'
+      const lines = stroke.text.split('\n')
+      for (let i = 0; i < lines.length; i++) {
+        ctx.fillText(lines[i]!, ax, ay + i * fontPx * TEXT_LINE_HEIGHT)
+      }
+      continue
+    }
     const pts = toPixel(stroke.points, width, height)
     if (pts.length < 4) continue
     switch (stroke.tool) {
@@ -160,6 +188,7 @@ export function distToSegment(px: number, py: number, ax: number, ay: number, bx
 /**
  * Expand a stroke into plain polylines: pen stays itself; arrow becomes shaft +
  * head triangle outline (3 polylines); rect becomes its 4-edge closed polyline.
+ * Text strokes have no outline — they are handled by bounding-box deletion instead.
  */
 function strokeToPolylines(stroke: Stroke): number[][] {
   const pts = stroke.points
@@ -227,9 +256,66 @@ function cutPolyline(pl: number[], ex1: number, ey1: number, ex2: number, ey2: n
 }
 
 /**
+ * Bounding box of a text stroke in the strokes' own coordinate space.
+ * `heightBasis` (default 1) is a uniform scale factor applied to x/y/font —
+ * pass the canvas pixel height to convert normalized strokes to pixels
+ * (anisotropy is ignored; hit-testing only needs an approximation).
+ * Width is estimated (CJK ≈ 1em, ASCII ≈ 0.55em); ponytail: swap in
+ * ctx.measureText if it ever mis-fires.
+ */
+export function textStrokeBBox(
+  stroke: Stroke,
+  heightBasis = 1,
+): { x: number; y: number; width: number; height: number } | null {
+  if (stroke.tool !== 'text' || !stroke.text) return null
+  const x = stroke.points[0]
+  const y = stroke.points[1]
+  if (x === undefined || y === undefined) return null
+  const fontPx = (stroke.font ?? DEFAULT_FONT_RATIO) * heightBasis
+  const lines = stroke.text.split('\n')
+  let maxUnits = 0
+  for (const line of lines) {
+    let units = 0
+    for (const ch of line) units += ch.charCodeAt(0) > 0xff ? 1 : 0.55
+    if (units > maxUnits) maxUnits = units
+  }
+  return {
+    x: x * heightBasis,
+    y: y * heightBasis,
+    width: maxUnits * fontPx,
+    height: lines.length * fontPx * TEXT_LINE_HEIGHT,
+  }
+}
+
+/** Does the eraser capsule (segment + radius) touch the given rect? */
+function segmentHitsRect(
+  ex1: number, ey1: number, ex2: number, ey2: number,
+  rect: { x: number; y: number; width: number; height: number },
+  radius: number,
+): boolean {
+  const r = {
+    x1: rect.x - radius, y1: rect.y - radius,
+    x2: rect.x + rect.width + radius, y2: rect.y + rect.height + radius,
+  }
+  const len = Math.hypot(ex2 - ex1, ey2 - ey1)
+  const steps = Math.max(1, Math.ceil(len / 2))
+  for (let s = 0; s <= steps; s++) {
+    const px = ex1 + ((ex2 - ex1) * s) / steps
+    const py = ey1 + ((ey2 - ey1) * s) / steps
+    if (px >= r.x1 && px <= r.x2 && py >= r.y1 && py <= r.y2) return true
+  }
+  return false
+}
+
+/**
  * Erase part of `strokes` along the segment (ex1, ey1)-(ex2, ey2) with the given
  * radius. Untouched strokes keep their identity (same object). Returns
  * `{ strokes, changed }` so callers can skip redundant redraws.
+ *
+ * Text strokes can't be "cut" — an eraser pass over a text stroke's bounding
+ * box deletes it whole (standard whiteboard behavior; partial-erasing glyphs
+ * is meaningless). The bbox is computed in the strokes' own coordinate space
+ * (`font` scales like y, so no unit conversion is needed).
  */
 export function eraseStrokes(
   strokes: readonly Stroke[],
@@ -242,6 +328,15 @@ export function eraseStrokes(
   const out: Stroke[] = []
   let changed = false
   for (const stroke of strokes) {
+    if (stroke.tool === 'text') {
+      const bbox = textStrokeBBox(stroke)
+      if (bbox !== null && segmentHitsRect(ex1, ey1, ex2, ey2, bbox, radius)) {
+        changed = true
+        continue
+      }
+      out.push(stroke)
+      continue
+    }
     const polylines = strokeToPolylines(stroke)
     if (!polylines.some(pl => polylineHitsSegment(pl, ex1, ey1, ex2, ey2, radius))) {
       out.push(stroke)

@@ -9,7 +9,7 @@
  */
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { composeScreenshot, drawStrokes, eraseStrokes, getArrowHead } from './drawing.ts'
+import { composeScreenshot, drawStrokes, eraseStrokes, getArrowHead, textStrokeBBox } from './drawing.ts'
 import type { Stroke } from './drawing.ts'
 
 const FAKE_SCREENSHOT = 'data:image/png;base64,fake'
@@ -30,6 +30,9 @@ function makeFakeCtx() {
     strokeRect: push('strokeRect'),
     clearRect: push('clearRect'),
     drawImage: push('drawImage'),
+    fillText: push('fillText'),
+    font: '',
+    textBaseline: '',
   }
 }
 
@@ -205,5 +208,65 @@ describe('eraseStrokes 像素级橡皮（2026-08-25：矢量切割，不整条�
     const { strokes } = eraseStrokes([PEN, other], 50, 40, 50, 60, 10)
     expect(strokes.filter(s => s === other)).toHaveLength(1)
     expect(strokes.length).toBe(3) // PEN 切成 2 + other 原样
+  })
+
+  it('文本笔画：擦到包围盒整删（字形无法切割），未擦到原样', () => {
+    const text: Stroke = { tool: 'text', points: [100, 100], text: '往右移', font: 16 } // 文档 px
+    // 从文字上方竖擦（穿过包围盒：宽≈4字×16=64，高≈19.2）
+    const hit = eraseStrokes([text], 110, 90, 110, 130, 10)
+    expect(hit.changed).toBe(true)
+    expect(hit.strokes).toHaveLength(0)
+    // 远处擦不动它（同一对象引用）
+    const miss = eraseStrokes([text], 400, 400, 420, 420, 10)
+    expect(miss.changed).toBe(false)
+    expect(miss.strokes[0]).toBe(text)
+  })
+})
+
+describe('textStrokeBBox（2026-08-26 文本工具）', () => {
+  it('CJK 按 1em、ASCII 按 0.55em 估算宽度，多行累加高度', () => {
+    const bb = textStrokeBBox({ tool: 'text', points: [10, 20], text: 'ab\n中文', font: 10 })
+    expect(bb).not.toBeNull()
+    expect(bb!.x).toBe(10)
+    expect(bb!.y).toBe(20)
+    expect(bb!.width).toBeCloseTo(2 * 10, 5) // 「中文」2 字 × 1em × 10px
+    expect(bb!.height).toBeCloseTo(2 * 10 * 1.2, 5)
+  })
+
+  it('归一化坐标经 heightBasis 换算成像素', () => {
+    const bb = textStrokeBBox({ tool: 'text', points: [0.1, 0.2], text: 'ab', font: 0.02 }, 800)
+    expect(bb!.x).toBeCloseTo(80, 5)
+    expect(bb!.y).toBeCloseTo(160, 5)
+    expect(bb!.width).toBeCloseTo(2 * 0.55 * 0.02 * 800, 5) // 17.6
+  })
+
+  it('非文本笔画 / 空文本返回 null', () => {
+    expect(textStrokeBBox({ tool: 'pen', points: [0, 0, 1, 1] })).toBeNull()
+    expect(textStrokeBBox({ tool: 'text', points: [0, 0], text: '' })).toBeNull()
+  })
+})
+
+describe('drawStrokes 文本渲染（2026-08-26）', () => {
+  it('文本笔画按高度基准换算字号，多行逐行 fillText', () => {
+    const ctx = makeFakeCtx()
+    drawStrokes(ctx as unknown as CanvasRenderingContext2D, [
+      { tool: 'text', points: [0.5, 0.25], text: '第一行\n第二行', font: 0.02 },
+    ], 200, 100)
+    const fills = ctx.calls.filter(c => c.method === 'fillText')
+    expect(fills).toHaveLength(2)
+    expect(fills[0]!.args).toEqual(['第一行', 100, 25])
+    // 第二行 y = 25 + fontPx(2) × 1.2
+    expect(fills[1]!.args[0]).toBe('第二行')
+    expect(fills[1]!.args[2]).toBeCloseTo(25 + 2 * 1.2, 5)
+  })
+
+  it('空文本笔画安全跳过', () => {
+    const ctx = makeFakeCtx()
+    drawStrokes(ctx as unknown as CanvasRenderingContext2D, [
+      { tool: 'text', points: [0.5, 0.25], text: '' },
+      { tool: 'pen', points: [0, 0, 1, 1] },
+    ], 200, 100)
+    expect(ctx.calls.filter(c => c.method === 'fillText')).toHaveLength(0)
+    expect(ctx.calls.filter(c => c.method === 'stroke')).toHaveLength(1) // pen 照常
   })
 })
